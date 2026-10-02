@@ -5,12 +5,19 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#12306B">
   <title>Zavelo</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230B1F4B'/%3E%3Cpath d='M18 18h28v6L26 42h20v6H18v-6l20-18H18z' fill='%23F2C230'/%3E%3C/svg%3E">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="icon" href="/icons/favicon-32.png" sizes="32x32" type="image/png">
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Zavelo">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <!-- Icons (Material Design icons, Apache 2.0) -->
   <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="zv-icon" viewBox="0 0 240 240"><rect width="240" height="240" rx="52" fill="#0B1F4B"/><g transform="translate(-5 19)"><path d="M70 68H150L202 30L188 98V150Q188 172 166 172H70Q48 172 48 150V90Q48 68 70 68Z" fill="none" stroke="#F2C230" stroke-width="9" stroke-linejoin="round"/><path transform="translate(75 77) scale(3.6)" fill="#F2C230" d="M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z"/></g></symbol>
     <symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/></symbol>
     <symbol id="i-mic-off" viewBox="0 0 24 24"><path d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z"/></symbol>
     <symbol id="i-cam" viewBox="0 0 24 24"><path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/></symbol>
@@ -37,6 +44,7 @@
   <!-- Sign in / create account -->
   <section id="auth" class="auth" hidden>
     <div class="auth-card">
+      <svg class="auth-logo" aria-hidden="true"><use href="#zv-icon"/></svg>
       <h1>Zavelo</h1>
       <p class="sub">Call and message anyone with just their key.</p>
       <div class="tabs" role="tablist">
@@ -72,6 +80,7 @@
         <button id="menu-btn" class="ibtn" aria-label="Menu"><svg class="ic"><use href="#i-more"/></svg></button>
         <div id="menu" class="menu" hidden>
           <button id="menu-copy">Copy my key</button>
+          <button id="menu-settings">Settings</button>
           <button id="menu-logout">Sign out</button>
         </div>
       </header>
@@ -189,6 +198,88 @@
       <div class="cwrap"><button id="answer" class="cbtn accept" aria-label="Answer"><svg class="ic"><use href="#i-phone"/></svg></button><span>Answer</span></div>
     </div>
   </section>
+
+  <!-- Settings -->
+  <section id="settings" class="overlay settings" hidden>
+    <header class="bar">
+      <button id="settings-close" class="ibtn" aria-label="Back"><svg class="ic"><use href="#i-back"/></svg></button>
+      <h2 class="grow">Settings</h2>
+    </header>
+    <div class="settings-body">
+      <h3>App lock</h3>
+      <p class="hint">Ask for a PIN, password or fingerprint when you open Zavelo. The lock is kept on this device only.</p>
+
+      <div id="lock-off">
+        <button id="lock-enable" class="primary" type="button">Turn on app lock</button>
+      </div>
+
+      <form id="lock-setup" hidden>
+        <p class="label">Unlock with</p>
+        <label class="choice"><input type="radio" name="lock-type" value="pin" checked> PIN (4 to 6 digits)</label>
+        <label class="choice"><input type="radio" name="lock-type" value="password"> Password</label>
+        <label for="lock-secret" id="lock-secret-label" class="label">New PIN</label>
+        <input id="lock-secret" class="field" type="password" inputmode="numeric" maxlength="6" autocomplete="new-password">
+        <label for="lock-confirm" class="label">Repeat it</label>
+        <input id="lock-confirm" class="field" type="password" inputmode="numeric" maxlength="6" autocomplete="new-password">
+        <label id="bio-choice" class="choice" hidden><input type="checkbox" id="lock-bio"> Also unlock with fingerprint or face</label>
+        <p id="lock-error" class="error" role="alert"></p>
+        <div class="btn-row">
+          <button type="button" id="lock-cancel" class="ghost">Cancel</button>
+          <button type="submit" class="primary">Save</button>
+        </div>
+      </form>
+
+      <form id="lock-verify" hidden>
+        <label for="verify-secret" id="verify-label" class="label">Enter your PIN</label>
+        <input id="verify-secret" class="field" type="password" autocomplete="off">
+        <p id="verify-error" class="error" role="alert"></p>
+        <div class="btn-row">
+          <button type="button" id="verify-cancel" class="ghost">Cancel</button>
+          <button type="submit" class="primary">Continue</button>
+        </div>
+      </form>
+
+      <div id="lock-on" hidden>
+        <p id="lock-summary" class="summary"></p>
+        <label for="lock-timeout" class="label">Lock after</label>
+        <select id="lock-timeout" class="field">
+          <option value="0">Immediately</option>
+          <option value="60">1 minute</option>
+          <option value="300">5 minutes</option>
+          <option value="1800">30 minutes</option>
+        </select>
+        <div class="btn-row">
+          <button type="button" id="lock-now" class="ghost">Lock now</button>
+          <button type="button" id="lock-change" class="ghost">Change lock</button>
+        </div>
+        <button type="button" id="lock-disable" class="linkbtn">Turn off app lock</button>
+      </div>
+
+      <hr>
+      <h3>Install</h3>
+      <p id="install-text" class="hint"></p>
+      <button id="install-btn" class="primary" type="button" hidden>Install Zavelo</button>
+    </div>
+  </section>
+
+  <!-- Lock screen -->
+  <section id="lock" class="overlay lock" hidden>
+    <svg class="lock-logo" aria-hidden="true"><use href="#zv-icon"/></svg>
+    <h2>Zavelo is locked</h2>
+    <form id="lock-form">
+      <input id="lock-input" class="field" type="password" autocomplete="off" placeholder="Enter PIN" aria-label="PIN">
+      <button id="lock-submit" class="primary" type="submit">Unlock</button>
+    </form>
+    <p id="lock-msg" class="error" role="alert"></p>
+    <button id="lock-bio-btn" class="ghost" type="button" hidden>Use fingerprint or face</button>
+    <button id="lock-forgot" class="linkbtn" type="button">Forgot it? Sign out</button>
+  </section>
+
+  <!-- Opening animation (about 4 seconds) -->
+  <div id="splash" class="splash" role="presentation">
+    <svg class="splash-icon" aria-hidden="true"><use href="#zv-icon"/></svg>
+    <p class="splash-name">Zavelo</p>
+  </div>
 
   <p id="toast" class="toast" role="status" hidden></p>
   <script src="/app.js"></script>

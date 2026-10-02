@@ -133,7 +133,7 @@ document.addEventListener("click", (e) => {
   if (!e.target.closest("#attach-menu") && !e.target.closest("#attach-btn")) $("#attach-menu").hidden = true;
 });
 
-$("#menu-logout").onclick = async () => {
+async function signOut() {
   $("#menu").hidden = true;
   endCall(null, true);
   dismissIncoming();
@@ -141,11 +141,15 @@ $("#menu-logout").onclick = async () => {
   const ws = state.ws;
   state.me = null; state.ws = null;
   if (ws) ws.close();
-  await api("/api/auth/logout", { body: {} });
+  clearLock();
+  unlock();
+  $("#settings").hidden = true;
+  await api("/api/auth/logout", { body: {} }).catch(() => {});
   selectTab("login");
   $("#app").hidden = true;
   $("#auth").hidden = false;
-};
+}
+$("#menu-logout").onclick = signOut;
 
 $("#find-key").oninput = (e) => {
   const v = e.target.value;
@@ -849,7 +853,317 @@ function startRinging() {
 }
 function stopRinging() { clearInterval(ringTimer); ringTimer = null; }
 
+/* ---------- Opening animation (4 seconds, tap to skip) ---------- */
+
+function runSplash() {
+  const splash = $("#splash");
+  const calm = matchMedia("(prefers-reduced-motion: reduce)").matches;   // no bouncing for people who turn motion off
+  splash.classList.toggle("calm", calm);
+  return new Promise((resolve) => {
+    const done = () => { if (splash.isConnected) { splash.remove(); resolve(); } };
+    setTimeout(done, calm ? 1200 : 4000);
+    splash.addEventListener("click", done);
+  });
+}
+const splashDone = runSplash();
+
+/* ---------- App lock (kept on this device only) ---------- */
+/* This is a privacy screen, like the lock in WhatsApp: it hides your chats from someone
+   holding your unlocked phone. It does not replace your phone's own lock. */
+
+const LOCK_KEY = "zavelo.lock", FAIL_KEY = "zavelo.lock.fails";
+const PBKDF2_ROUNDS = 210000;
+const enc = new TextEncoder();
+const b64 = (bytes) => btoa(String.fromCharCode(...bytes));
+const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+const readJson = (k) => { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } };
+const lockConfig = () => readJson(LOCK_KEY);
+const saveLock = (cfg) => localStorage.setItem(LOCK_KEY, JSON.stringify(cfg));
+function clearLock() { localStorage.removeItem(LOCK_KEY); localStorage.removeItem(FAIL_KEY); }
+
+async function hashSecret(secret, salt) {
+  const key = await crypto.subtle.importKey("raw", enc.encode(secret), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations: PBKDF2_ROUNDS }, key, 256);
+  return b64(new Uint8Array(bits));
+}
+async function checkSecret(secret, cfg) { return (await hashSecret(secret, unb64(cfg.salt))) === cfg.hash; }
+
+/* After 5 wrong tries the lock makes you wait: 30 s, then 60 s, 2 min, and so on up to 15 min. */
+function cooldownLeft() {
+  const f = readJson(FAIL_KEY);
+  return f && f.until > Date.now() ? Math.ceil((f.until - Date.now()) / 1000) : 0;
+}
+function recordFail() {
+  const f = readJson(FAIL_KEY) || { count: 0, until: 0 };
+  f.count++;
+  if (f.count % 5 === 0) f.until = Date.now() + Math.min(30 * 2 ** (f.count / 5 - 1), 900) * 1000;
+  localStorage.setItem(FAIL_KEY, JSON.stringify(f));
+}
+const clearFails = () => localStorage.removeItem(FAIL_KEY);
+
+/* Fingerprint / face: uses the phone's own screen-lock sensor through the browser (WebAuthn). */
+async function biometricAvailable() {
+  try {
+    return !!(window.PublicKeyCredential && await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable());
+  } catch { return false; }
+}
+async function registerBiometric() {
+  const cred = await navigator.credentials.create({
+    publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      rp: { name: "Zavelo" },
+      user: { id: crypto.getRandomValues(new Uint8Array(16)), name: state.me.key, displayName: state.me.displayName },
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+      authenticatorSelection: { authenticatorAttachment: "platform", userVerification: "required", residentKey: "discouraged" },
+      timeout: 60000,
+    },
+  });
+  return b64(new Uint8Array(cred.rawId));
+}
+async function verifyBiometric(cfg) {
+  await navigator.credentials.get({
+    publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      allowCredentials: [{ type: "public-key", id: unb64(cfg.bio), transports: ["internal"] }],
+      userVerification: "required",
+      timeout: 60000,
+    },
+  });
+}
+
+/* The lock screen */
+const lockState = { locked: false, hiddenAt: 0 };
+let coolTimer = null;
+
+function lockApp() {
+  const cfg = lockConfig();
+  if (!cfg || lockState.locked) return;
+  lockState.locked = true;
+  const pin = cfg.type === "pin";
+  const input = $("#lock-input");
+  input.value = "";
+  input.setAttribute("inputmode", pin ? "numeric" : "text");
+  input.setAttribute("maxlength", pin ? String(cfg.len) : "64");
+  input.setAttribute("aria-label", pin ? "PIN" : "Password");
+  input.placeholder = pin ? "Enter PIN" : "Enter password";
+  $("#lock-msg").textContent = "";
+  $("#lock-bio-btn").hidden = !cfg.bio;
+  $("#lock").hidden = false;
+  updateCooldown();
+  if (cfg.bio) splashDone.then(() => { if (lockState.locked) tryBiometric(); });
+  else splashDone.then(() => { if (lockState.locked && !input.disabled) input.focus(); });
+}
+
+function unlock() {
+  lockState.locked = false;
+  clearInterval(coolTimer);
+  $("#lock").hidden = true;
+  $("#lock-input").value = "";
+  $("#lock-input").blur();
+}
+
+function updateCooldown() {
+  clearInterval(coolTimer);
+  const tick = () => {
+    const secs = cooldownLeft();
+    $("#lock-input").disabled = secs > 0;
+    $("#lock-submit").disabled = secs > 0;
+    if (secs > 0) $("#lock-msg").textContent = `Too many tries. Wait ${secs} s.`;
+    else {
+      clearInterval(coolTimer);
+      if ($("#lock-msg").textContent.startsWith("Too many")) $("#lock-msg").textContent = "";
+    }
+  };
+  tick();
+  if (cooldownLeft() > 0) coolTimer = setInterval(tick, 1000);
+}
+
+async function tryUnlock() {
+  const cfg = lockConfig();
+  const value = $("#lock-input").value;
+  if (!cfg || !value || cooldownLeft() > 0) return;
+  if (await checkSecret(value, cfg)) { clearFails(); unlock(); return; }
+  recordFail();
+  $("#lock-input").value = "";
+  $("#lock-msg").textContent = cfg.type === "pin" ? "Wrong PIN." : "Wrong password.";
+  updateCooldown();
+}
+
+async function tryBiometric() {
+  const cfg = lockConfig();
+  if (!cfg || !cfg.bio) return;
+  try { await verifyBiometric(cfg); clearFails(); unlock(); }
+  catch { if (lockState.locked && cooldownLeft() === 0) $("#lock-msg").textContent = "Fingerprint did not work. Use your " + (cfg.type === "pin" ? "PIN." : "password."); }
+}
+
+$("#lock-form").onsubmit = (e) => { e.preventDefault(); tryUnlock(); };
+$("#lock-input").oninput = (e) => {
+  const cfg = lockConfig();
+  if (!cfg || cfg.type !== "pin") return;
+  e.target.value = e.target.value.replace(/\D/g, "").slice(0, cfg.len);
+  if (e.target.value.length === cfg.len) tryUnlock();      // a PIN unlocks as soon as the last digit is typed
+};
+$("#lock-bio-btn").onclick = tryBiometric;
+$("#lock-forgot").onclick = () => { if (confirm("Signing out removes the lock from this device. You will need to sign in again.")) signOut(); };
+
+/* Lock again when you come back after being away */
+document.addEventListener("visibilitychange", () => {
+  const cfg = lockConfig();
+  if (!cfg || !state.me) return;
+  if (document.hidden) lockState.hiddenAt = Date.now();
+  else if (lockState.hiddenAt && (Date.now() - lockState.hiddenAt) / 1000 >= cfg.timeout) lockApp();
+});
+
+/* ---------- Settings ---------- */
+
+let bioAvailable = false, afterVerify = null;
+const showLockPane = (name) => {
+  $("#lock-off").hidden = name !== "off";
+  $("#lock-setup").hidden = name !== "setup";
+  $("#lock-verify").hidden = name !== "verify";
+  $("#lock-on").hidden = name !== "on";
+};
+
+function renderLockSettings() {
+  const cfg = lockConfig();
+  if (!cfg) { showLockPane("off"); return; }
+  $("#lock-summary").textContent = "Locked with " + (cfg.type === "pin" ? "a PIN" : "a password") +
+    (cfg.bio ? " and fingerprint or face unlock." : ".");
+  $("#lock-timeout").value = String(cfg.timeout);
+  showLockPane("on");
+}
+
+async function openSettings() {
+  $("#menu").hidden = true;
+  $("#settings").hidden = false;
+  renderLockSettings();
+  refreshInstallRow();
+  bioAvailable = await biometricAvailable();
+  $("#bio-choice").hidden = !bioAvailable;
+}
+$("#menu-settings").onclick = openSettings;
+$("#settings-close").onclick = () => { $("#settings").hidden = true; };
+
+function openSetup() {
+  document.querySelector('input[name="lock-type"][value="pin"]').checked = true;
+  applyLockType();
+  $("#lock-bio").checked = bioAvailable;
+  $("#lock-error").textContent = "";
+  showLockPane("setup");
+  $("#lock-secret").focus();
+}
+
+function applyLockType() {
+  const pin = document.querySelector('input[name="lock-type"]:checked').value === "pin";
+  for (const id of ["#lock-secret", "#lock-confirm"]) {
+    $(id).value = "";
+    $(id).setAttribute("inputmode", pin ? "numeric" : "text");
+    $(id).setAttribute("maxlength", pin ? "6" : "64");
+  }
+  $("#lock-secret-label").textContent = pin ? "New PIN" : "New password";
+}
+document.querySelectorAll('input[name="lock-type"]').forEach((r) => (r.onchange = applyLockType));
+
+$("#lock-enable").onclick = openSetup;
+$("#lock-cancel").onclick = renderLockSettings;
+
+$("#lock-setup").onsubmit = async (e) => {
+  e.preventDefault();
+  const err = $("#lock-error");
+  err.textContent = "";
+  const type = document.querySelector('input[name="lock-type"]:checked').value;
+  const secret = $("#lock-secret").value;
+  if (type === "pin" && !/^\d{4,6}$/.test(secret)) { err.textContent = "A PIN must be 4 to 6 digits."; return; }
+  if (type === "password" && secret.length < 6) { err.textContent = "A password must be at least 6 characters."; return; }
+  if (secret !== $("#lock-confirm").value) { err.textContent = "The two entries do not match."; return; }
+  if (!window.crypto || !crypto.subtle) { err.textContent = "The lock needs a secure connection (HTTPS)."; return; }
+
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const old = lockConfig();
+  const cfg = {
+    owner: state.me.key, type, len: secret.length, salt: b64(salt),
+    hash: await hashSecret(secret, salt), bio: null, timeout: old ? old.timeout : 60,
+  };
+  let note = "App lock is on";
+  if (bioAvailable && $("#lock-bio").checked) {
+    try { cfg.bio = await registerBiometric(); }
+    catch { note = "App lock is on. Fingerprint was not set up."; }
+  }
+  saveLock(cfg);
+  clearFails();
+  renderLockSettings();
+  flash(note);
+};
+
+/* Changing or removing the lock asks for the current PIN or password first */
+function verifyThen(action) {
+  const cfg = lockConfig();
+  if (!cfg) return;
+  afterVerify = action;
+  $("#verify-label").textContent = cfg.type === "pin" ? "Enter your current PIN" : "Enter your current password";
+  $("#verify-secret").setAttribute("inputmode", cfg.type === "pin" ? "numeric" : "text");
+  $("#verify-secret").value = "";
+  $("#verify-error").textContent = "";
+  showLockPane("verify");
+  $("#verify-secret").focus();
+}
+$("#lock-verify").onsubmit = async (e) => {
+  e.preventDefault();
+  const cfg = lockConfig();
+  const wait = cooldownLeft();
+  if (wait > 0) { $("#verify-error").textContent = `Too many tries. Wait ${wait} s.`; return; }
+  if (await checkSecret($("#verify-secret").value, cfg)) { clearFails(); const go = afterVerify; afterVerify = null; go(); }
+  else { recordFail(); $("#verify-secret").value = ""; $("#verify-error").textContent = "That is not right."; }
+};
+$("#verify-cancel").onclick = renderLockSettings;
+
+$("#lock-change").onclick = () => verifyThen(openSetup);
+$("#lock-disable").onclick = () => verifyThen(() => { clearLock(); renderLockSettings(); flash("App lock is off"); });
+$("#lock-now").onclick = () => { $("#settings").hidden = true; lockApp(); };
+$("#lock-timeout").onchange = (e) => {
+  const cfg = lockConfig();
+  if (cfg) { cfg.timeout = Number(e.target.value); saveLock(cfg); }
+};
+
+/* ---------- Install as an app ---------- */
+
+let installEvent = null;
+const isStandalone = () => matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+
+function refreshInstallRow() {
+  const text = $("#install-text"), btn = $("#install-btn");
+  btn.hidden = true;
+  if (isStandalone()) text.textContent = "Zavelo is installed on this device.";
+  else if (installEvent) { text.textContent = "Add Zavelo to your home screen or desktop so it opens like an app."; btn.hidden = false; }
+  else if (/iphone|ipad|ipod/i.test(navigator.userAgent)) text.textContent = "On iPhone or iPad: tap the Share button, then Add to Home Screen.";
+  else text.textContent = "To install, open your browser menu and choose Install app or Add to Home screen.";
+}
+window.addEventListener("beforeinstallprompt", (e) => { e.preventDefault(); installEvent = e; refreshInstallRow(); });
+window.addEventListener("appinstalled", () => { installEvent = null; refreshInstallRow(); flash("Zavelo installed"); });
+$("#install-btn").onclick = async () => {
+  if (!installEvent) return;
+  installEvent.prompt();
+  await installEvent.userChoice;
+  installEvent = null;
+  refreshInstallRow();
+};
+
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => {}));
+}
+
 /* ---------- Start ---------- */
 
-// On load: resume the session if there is one.
-api("/api/me").then(enter).catch(() => { $("#auth").hidden = false; });
+function boot() {
+  const cfg = lockConfig();
+  if (cfg) lockApp();                      // a fresh open starts locked, before anything is shown
+  api("/api/me").then((profile) => {
+    if (cfg && cfg.owner !== profile.key) { clearLock(); unlock(); }   // the lock belonged to someone else
+    enter(profile);
+  }).catch((err) => {
+    if (err instanceof TypeError) { setTimeout(boot, 4000); flash("Cannot reach Zavelo. Trying again..."); return; }
+    clearLock(); unlock();                 // not signed in, so there is nothing to protect
+    $("#auth").hidden = false;
+  });
+}
+boot();

@@ -187,3 +187,51 @@ h1, h2, p { margin: 0; }
   .back { display: inline-grid; }
   .msg { max-width: 88%; }
 }
+
+/* ---------- Auth logo, shared form bits ---------- */
+.auth-logo { width: 56px; height: 56px; border-radius: 21.7%; display: block; margin-bottom: 10px; }
+.field { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid transparent; background: var(--navy-raised); color: var(--white); font: inherit; }
+select.field { appearance: auto; }
+.ghost { border: 1px solid var(--white); border-radius: 8px; padding: 10px 14px; }
+.linkbtn { color: var(--turquoise); text-decoration: underline; padding: 8px; }
+.btn-row { display: flex; gap: 10px; margin-top: 16px; }
+.btn-row .primary, .btn-row .ghost { margin-top: 0; flex: 1; width: auto; }
+
+/* ---------- Settings ---------- */
+.settings { z-index: 12; }
+.settings-body { width: 100%; max-width: 520px; margin: 0 auto; padding: 18px; overflow-y: auto; flex: 1; }
+.settings-body h3 { color: var(--gold); font-size: 16px; margin: 0 0 4px; }
+.settings-body .hint { padding: 0 0 12px; }
+.settings-body .label { margin: 14px 0 5px; }
+.settings-body hr { border: 0; border-top: 1px solid var(--white); margin: 24px 0; }
+.choice { display: flex; align-items: center; gap: 10px; padding: 7px 0; }
+.choice input { accent-color: var(--gold); width: 16px; height: 16px; }
+.summary { margin-bottom: 4px; }
+
+/* ---------- Lock screen ---------- */
+.lock { z-index: 150; align-items: center; justify-content: center; text-align: center; gap: 12px; padding: 20px; }
+.lock h2 { color: var(--gold); font-size: 20px; }
+.lock-logo { width: 72px; height: 72px; border-radius: 21.7%; box-shadow: 0 0 0 2px rgba(255, 255, 255, .3); }
+.lock form { display: flex; flex-direction: column; gap: 10px; width: min(280px, 80vw); }
+.lock .field { text-align: center; font-size: 18px; letter-spacing: .25em; }
+.lock .field::placeholder { letter-spacing: normal; font-size: 14px; }
+.lock .primary { margin-top: 0; }
+.lock .error { margin: 0; }
+
+/* ---------- Opening animation: drop, bounce, name. 4 seconds in total ---------- */
+.splash { position: fixed; inset: 0; z-index: 200; background: var(--navy-deep); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; cursor: pointer; animation: splash-out .5s ease 3.5s forwards; }
+.splash-icon { width: 112px; height: 112px; border-radius: 21.7%; box-shadow: 0 0 0 2px rgba(255, 255, 255, .3); animation: drop 1.9s both; }
+.splash-name { margin: 0; color: var(--gold); font-size: 30px; font-weight: 600; letter-spacing: .12em; animation: name-in .6s ease 2s both; }
+@keyframes drop {
+  0%   { transform: translateY(-75vh); animation-timing-function: cubic-bezier(.55, .05, .9, .5); }
+  40%  { transform: translateY(0) scale(1.08, .92); animation-timing-function: cubic-bezier(.15, .6, .4, 1); }
+  55%  { transform: translateY(-72px) scale(.97, 1.03); animation-timing-function: cubic-bezier(.55, .05, .9, .5); }
+  68%  { transform: translateY(0) scale(1.05, .95); animation-timing-function: cubic-bezier(.15, .6, .4, 1); }
+  80%  { transform: translateY(-24px); animation-timing-function: cubic-bezier(.55, .05, .9, .5); }
+  90%  { transform: translateY(0) scale(1.02, .98); }
+  100% { transform: translateY(0) scale(1); }
+}
+@keyframes name-in { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+@keyframes splash-out { to { opacity: 0; visibility: hidden; } }
+.splash.calm { animation: splash-out .3s ease .9s forwards; }
+.splash.calm .splash-icon, .splash.calm .splash-name { animation: none; }

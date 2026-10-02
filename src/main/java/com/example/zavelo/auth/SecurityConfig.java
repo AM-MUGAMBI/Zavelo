@@ -30,7 +30,8 @@ public class SecurityConfig {
             // CSRF is off to keep step 1 simple; we turn it on before going live.
             .csrf(csrf -> csrf.disable())
             .authorizeHttpRequests(auth -> auth
-                .requestMatchers("/", "/index.html", "/app.js", "/style.css", "/healthz").permitAll()
+                .requestMatchers("/", "/index.html", "/app.js", "/style.css", "/healthz",
+                        "/sw.js", "/manifest.json", "/icon.svg", "/icons/**").permitAll()
                 .requestMatchers("/api/auth/register", "/api/auth/login").permitAll()
                 .anyRequest().authenticated())
             .exceptionHandling(e -> e.authenticationEntryPoint(new HttpStatusEntryPoint(HttpStatus.UNAUTHORIZED)));
