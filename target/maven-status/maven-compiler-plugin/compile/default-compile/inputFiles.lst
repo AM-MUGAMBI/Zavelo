@@ -1,0 +1,16 @@
+/home/mugambi/Zavelo/src/main/java/com/example/zavelo/ZaveloApplication.java
+/home/mugambi/Zavelo/src/main/java/com/example/zavelo/auth/AppUserDetailsService.java
+/home/mugambi/Zavelo/src/main/java/com/example/zavelo/auth/AuthController.java
+/home/mugambi/Zavelo/src/main/java/com/example/zavelo/auth/SecurityConfig.java
+/home/mugambi/Zavelo/src/main/java/com/example/zavelo/chat/ChatController.java
+/home/mugambi/Zavelo/src/main/java/com/example/zavelo/chat/ChatSocketHandler.java
+/home/mugambi/Zavelo/src/main/java/com/example/zavelo/chat/FileController.java
+/home/mugambi/Zavelo/src/main/java/com/example/zavelo/chat/IceController.java
+/home/mugambi/Zavelo/src/main/java/com/example/zavelo/chat/Message.java
+/home/mugambi/Zavelo/src/main/java/com/example/zavelo/chat/MessageDto.java
+/home/mugambi/Zavelo/src/main/java/com/example/zavelo/chat/MessageRepository.java
+/home/mugambi/Zavelo/src/main/java/com/example/zavelo/chat/VoiceController.java
+/home/mugambi/Zavelo/src/main/java/com/example/zavelo/chat/WebSocketConfig.java
+/home/mugambi/Zavelo/src/main/java/com/example/zavelo/user/AppUser.java
+/home/mugambi/Zavelo/src/main/java/com/example/zavelo/user/UserRepository.java
+/home/mugambi/Zavelo/src/main/java/com/example/zavelo/user/UserService.java
