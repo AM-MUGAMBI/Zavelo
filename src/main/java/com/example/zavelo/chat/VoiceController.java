@@ -3,6 +3,7 @@ package com.example.zavelo.chat;
 import com.example.zavelo.user.AppUser;
 import com.example.zavelo.user.UserRepository;
 import com.example.zavelo.user.UserService;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.Resource;
 import org.springframework.http.HttpStatus;
@@ -31,14 +32,16 @@ public class VoiceController {
             "audio/webm", "webm", "audio/ogg", "ogg", "audio/mp4", "m4a",
             "audio/mpeg", "mp3", "audio/wav", "wav");
 
-    private final Path dir = Paths.get("data", "voice");
+    private final Path dir;
     private final MessageRepository messages;
     private final UserRepository users;
     private final UserService userService;
     private final ChatSocketHandler socket;
 
     public VoiceController(MessageRepository messages, UserRepository users,
-                           UserService userService, ChatSocketHandler socket) {
+                           UserService userService, ChatSocketHandler socket,
+                           @Value("${zavelo.data-dir:data}") String dataDir) {
+        this.dir = Paths.get(dataDir, "voice");
         this.messages = messages;
         this.users = users;
         this.userService = userService;

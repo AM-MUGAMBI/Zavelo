@@ -1,0 +1,42 @@
+# Render Blueprint: Render reads this file and creates the app and database for you.
+databases:
+  - name: zavelo-db
+    databaseName: zavelo
+    user: zavelo
+    plan: free            # free databases expire after 30 days. Change to a paid plan to keep your data.
+
+services:
+  - type: web
+    name: zavelo
+    runtime: docker
+    plan: starter         # a persistent disk needs a paid plan
+    healthCheckPath: /healthz
+    disk:
+      name: zavelo-data   # voice notes and files live here
+      mountPath: /var/data
+      sizeGB: 20          # must be bigger than the largest file you want to send
+    envVars:
+      - key: SPRING_PROFILES_ACTIVE
+        value: prod
+      - key: DATA_DIR
+        value: /var/data
+      - key: DB_HOST
+        fromDatabase:
+          name: zavelo-db
+          property: host
+      - key: DB_PORT
+        fromDatabase:
+          name: zavelo-db
+          property: port
+      - key: DB_NAME
+        fromDatabase:
+          name: zavelo-db
+          property: database
+      - key: DB_USER
+        fromDatabase:
+          name: zavelo-db
+          property: user
+      - key: DB_PASSWORD
+        fromDatabase:
+          name: zavelo-db
+          property: password

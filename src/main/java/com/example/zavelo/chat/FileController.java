@@ -5,6 +5,7 @@ import com.example.zavelo.user.UserRepository;
 import com.example.zavelo.user.UserService;
 import jakarta.annotation.PostConstruct;
 import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.Resource;
 import org.springframework.http.*;
@@ -46,8 +47,6 @@ public class FileController {
             "audio/mpeg", "audio/ogg", "audio/wav", "audio/webm", "audio/mp4", "audio/aac", "audio/flac",
             "application/pdf");
 
-    private static final Path FINAL_DIR = Paths.get("data", "files");
-    private static final Path TMP_DIR = Paths.get("data", "uploads-tmp");
 
     public record InitRequest(String to, String name, long size, String mime, String caption) {}
 
@@ -59,6 +58,8 @@ public class FileController {
         Path tmp;
     }
 
+    private final Path finalDir;
+    private final Path tmpDir;
     private final Map<String, Pending> pending = new ConcurrentHashMap<>();
     private final MessageRepository messages;
     private final UserRepository users;
@@ -66,7 +67,10 @@ public class FileController {
     private final ChatSocketHandler socket;
 
     public FileController(MessageRepository messages, UserRepository users,
-                          UserService userService, ChatSocketHandler socket) {
+                          UserService userService, ChatSocketHandler socket,
+                          @Value("${zavelo.data-dir:data}") String dataDir) {
+        this.finalDir = Paths.get(dataDir, "files");
+        this.tmpDir = Paths.get(dataDir, "uploads-tmp");
         this.messages = messages;
         this.users = users;
         this.userService = userService;
@@ -76,9 +80,9 @@ public class FileController {
     /** Unfinished uploads are forgotten when the server restarts, so clear their leftovers. */
     @PostConstruct
     void cleanTemp() throws IOException {
-        Files.createDirectories(TMP_DIR);
-        Files.createDirectories(FINAL_DIR);
-        try (DirectoryStream<Path> stream = Files.newDirectoryStream(TMP_DIR, "*.part")) {
+        Files.createDirectories(tmpDir);
+        Files.createDirectories(finalDir);
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(tmpDir, "*.part")) {
             for (Path p : stream) Files.deleteIfExists(p);
         }
     }
@@ -90,7 +94,7 @@ public class FileController {
 
         if (req.size() <= 0) throw fail(HttpStatus.BAD_REQUEST, "That file is empty.");
         if (req.size() > MAX_BYTES) throw fail(HttpStatus.PAYLOAD_TOO_LARGE, "Files can be up to 10 GB.");
-        if (Files.getFileStore(TMP_DIR).getUsableSpace() < req.size())
+        if (Files.getFileStore(tmpDir).getUsableSpace() < req.size())
             throw fail(HttpStatus.INSUFFICIENT_STORAGE, "The server does not have enough free space.");
 
         purgeStale();
@@ -105,7 +109,7 @@ public class FileController {
         p.caption = req.caption() == null ? "" : req.caption().trim();
         if (p.caption.length() > 1000) p.caption = p.caption.substring(0, 1000);
         p.size = req.size();
-        p.tmp = TMP_DIR.resolve(p.id + ".part");
+        p.tmp = tmpDir.resolve(p.id + ".part");
         Files.createFile(p.tmp);
         pending.put(p.id, p);
         return Map.of("uploadId", p.id, "chunkSize", CHUNK_BYTES);
@@ -150,7 +154,7 @@ public class FileController {
         synchronized (p) {
             if (p.received != p.size) throw fail(HttpStatus.CONFLICT, "The upload is not finished.");
             stored = UUID.randomUUID() + "." + extensionOf(p.name);
-            Files.move(p.tmp, FINAL_DIR.resolve(stored), StandardCopyOption.REPLACE_EXISTING);
+            Files.move(p.tmp, finalDir.resolve(stored), StandardCopyOption.REPLACE_EXISTING);
             pending.remove(p.id);
         }
         Message saved = messages.save(Message.file(sender.getConnectKey(), recipient.getConnectKey(),
@@ -178,8 +182,8 @@ public class FileController {
                 .filter(x -> x.getSenderKey().equals(me) || x.getRecipientKey().equals(me))
                 .orElseThrow(() -> fail(HttpStatus.NOT_FOUND, "File not found."));
 
-        Path file = FINAL_DIR.resolve(m.getFileStored()).normalize();
-        if (!file.startsWith(FINAL_DIR.normalize()) || !Files.exists(file))
+        Path file = finalDir.resolve(m.getFileStored()).normalize();
+        if (!file.startsWith(finalDir.normalize()) || !Files.exists(file))
             throw fail(HttpStatus.NOT_FOUND, "File not found.");
 
         boolean inline = !download && INLINE_TYPES.contains(m.getFileMime());
