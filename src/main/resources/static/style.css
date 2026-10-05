@@ -29,7 +29,7 @@ h1, h2, p { margin: 0; }
 .label { color: var(--turquoise); font-size: 12px; }
 .error { color: var(--danger-text); min-height: 1.4em; margin-top: 10px; font-size: 13px; }
 
-/* ---------- Sign in ---------- */
+/* Sign in  */
 .auth { min-height: 100%; display: grid; place-items: center; padding: 20px; background: var(--navy); }
 .auth-card { width: 100%; max-width: 380px; }
 .auth-card h1 { color: var(--gold); font-size: 28px; letter-spacing: -.02em; }
@@ -41,7 +41,7 @@ h1, h2, p { margin: 0; }
 .auth input { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid transparent; background: var(--navy-raised); }
 .primary { width: 100%; margin-top: 18px; padding: 11px; border-radius: 8px; background: var(--gold); color: var(--navy); font-weight: 700; }
 
-/* ---------- Layout ---------- */
+/* Layout  */
 .app { display: flex; height: 100%; max-width: 1500px; margin: 0 auto; background: var(--navy); }
 .sidebar { width: 380px; flex: none; display: flex; flex-direction: column; border-right: 1px solid var(--white); position: relative; }
 .pane { flex: 1; min-width: 0; position: relative; display: flex; background: var(--navy-deep); }
