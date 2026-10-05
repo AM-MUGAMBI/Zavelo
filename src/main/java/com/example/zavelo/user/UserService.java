@@ -1,5 +1,6 @@
 package com.example.zavelo.user;
 
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
@@ -37,7 +38,13 @@ public class UserService {
             throw new ResponseStatusException(HttpStatus.CONFLICT, "That username is taken.");
 
         AppUser user = new AppUser(generateKey(), username, displayName, encoder.encode(password));
-        return users.save(user);
+        try {
+            return users.save(user);
+        } catch (DataIntegrityViolationException e) {
+            if (users.existsByUsername(username))
+                throw new ResponseStatusException(HttpStatus.CONFLICT, "That username is taken.");
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Could not create the account. Try again.");
+        }
     }
 
     public AppUser findByKey(String key) {

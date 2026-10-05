@@ -235,3 +235,12 @@ select.field { appearance: auto; }
 @keyframes splash-out { to { opacity: 0; visibility: hidden; } }
 .splash.calm { animation: splash-out .3s ease .9s forwards; }
 .splash.calm .splash-icon, .splash.calm .splash-name { animation: none; }
+
+/* ---------- Connecting screen ---------- */
+.connecting { z-index: 11; align-items: center; justify-content: center; text-align: center; gap: 12px; padding: 20px; }
+.connecting h2 { color: var(--gold); font-size: 22px; }
+.connecting p { color: var(--muted); max-width: 280px; margin: 0; }
+.spinner { width: 26px; height: 26px; border-radius: 50%; border: 3px solid rgba(255, 255, 255, .25); border-top-color: var(--turquoise); animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 4s; } }
+.waking { position: fixed; top: 0; left: 0; right: 0; z-index: 190; margin: 0; padding: 8px 14px; text-align: center; font-size: 13px; font-weight: 600; background: var(--gold); color: var(--navy); }

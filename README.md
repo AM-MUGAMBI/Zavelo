@@ -27,9 +27,29 @@ zavelo.ice.turn.* in src/main/resources/application.properties.
 
 ## Deploy to Render
 1. Push this folder to a GitHub repository.
-2. In Render: New > Blueprint, pick the repository. Render reads render.yaml and creates the app and database.
+2. In Render: New > Blueprint, pick the repository. Render reads render.yaml and creates the app, the
+   PostgreSQL database and the storage disk. (Or create them by hand, see below.)
 3. When the build finishes, open the https address Render gives you.
-Settings for the free database, disk size and plan are in render.yaml.
+
+### Setting it up by hand
+- Web service: runtime Docker. The Dockerfile already switches the app to production mode.
+- Database: New > PostgreSQL. Copy its **Internal Database URL**.
+- On the web service, add one environment variable: `DATABASE_URL` = that URL.
+  (The older DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD values still work if you prefer them.)
+- Add a disk mounted at `/var/data` (needs a paid plan) so voice notes and files survive restarts.
+- If no database is set, the app refuses to start and says so in the logs. That is on purpose: without a
+  database, accounts live in a temporary file that is wiped every time the server restarts.
+
+### Staying signed in
+Logins are saved in the database and the login cookie lasts about 400 days (the most browsers allow), so
+restarts and redeploys do not sign anyone out.
+
+### The "starting your service" page
+Render's free web services go to sleep after 15 minutes without visitors, and the first visit afterwards
+shows Render's own "starting" page for up to a minute. Zavelo cannot remove that page on the free plan.
+- A paid web service (Starter) never sleeps.
+- Once the app is installed on a phone, it opens from its saved copy instead and shows "Waking up Zavelo"
+  while it reconnects.
 
 ## Install as an app
 Zavelo is a web app you can install. Open it over https (or localhost), then:

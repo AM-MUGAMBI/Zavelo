@@ -52,16 +52,63 @@ function flash(text) {
   flash.timer = setTimeout(() => (t.hidden = true), 3500);
 }
 
+class ApiError extends Error {
+  constructor(message, status) { super(message); this.status = status; }
+}
+
+/* While Render wakes a sleeping server it answers with its own page or a 502/503. Zavelo did not see
+   those requests, so it is safe to wait and ask again instead of showing an error. */
+const isWakingReply = (res) => res.status === 502 || res.status === 503 || res.status === 504 ||
+  (res.ok && !(res.headers.get("content-type") || "").includes("json"));
+
+function setWaking(on) {
+  if (!$("#connecting").hidden) {
+    $("#connecting-msg").textContent = on ? "Waking up Zavelo… this can take up to a minute." : "Connecting…";
+  } else {
+    $("#waking").hidden = !on;
+  }
+}
+
 async function api(path, options = {}) {
-  const res = await fetch(path, {
-    method: options.method || (options.body ? "POST" : "GET"),
+  const method = options.method || (options.body ? "POST" : "GET");
+  const maxTries = options.tries ?? 12;
+  const init = {
+    method,
     headers: { "Content-Type": "application/json" },
     credentials: "same-origin",
     body: options.body ? JSON.stringify(options.body) : undefined,
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.message || "Something went wrong. Try again.");
-  return data;
+  };
+
+  for (let attempt = 1; ; attempt++) {
+    let res;
+    try {
+      res = await fetch(path, init);
+    } catch {
+      // The request may or may not have arrived, so only reads are repeated automatically.
+      if (method === "GET" && attempt < maxTries) { setWaking(true); await sleep(Math.min(1500 * attempt, 6000)); continue; }
+      setWaking(false);
+      throw new ApiError("Cannot reach Zavelo. Check your internet connection and try again.", 0);
+    }
+
+    if (isWakingReply(res)) {
+      // 504 can mean the server did get the request, so only reads are repeated after a 504.
+      if (attempt < maxTries && (method === "GET" || res.status !== 504)) {
+        setWaking(true);
+        await sleep(Math.min(1500 * attempt, 6000));
+        continue;
+      }
+      setWaking(false);
+      throw new ApiError("Zavelo is still starting up. Wait a few seconds and try again.", res.ok ? 503 : res.status);
+    }
+    setWaking(false);
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      if (res.status === 401 && state.me && !path.startsWith("/api/auth/")) resetToLogin("You were signed out. Please sign in again.");
+      throw new ApiError(data.message || "Something went wrong. Try again.", res.status);
+    }
+    return data;
+  }
 }
 
 function mediaError(e) {
@@ -92,27 +139,55 @@ function selectTab(name) {
 $("#tab-login").onclick = () => selectTab("login");
 $("#tab-register").onclick = () => selectTab("register");
 
-$("#login-form").onsubmit = async (e) => {
-  e.preventDefault();
+/* Stops a second tap from sending the form twice while a slow server is waking up */
+async function withBusy(form, work) {
+  const btn = form.querySelector('button[type="submit"]');
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Please wait…";
+  try { return await work(); } finally { btn.disabled = false; btn.textContent = label; }
+}
+
+function rememberUser(name) { try { localStorage.setItem("zavelo.lastUser", name.trim()); } catch { /* optional */ } }
+function prefillUser() {
   try {
-    enter(await api("/api/auth/login", { body: { username: $("#l-user").value, password: $("#l-pass").value } }));
-  } catch (err) { $("#auth-error").textContent = err.message; }
+    const name = localStorage.getItem("zavelo.lastUser");
+    if (name && !$("#l-user").value) $("#l-user").value = name;
+  } catch { /* optional */ }
+}
+
+$("#login-form").onsubmit = (e) => {
+  e.preventDefault();
+  withBusy(e.currentTarget, async () => {
+    try {
+      const profile = await api("/api/auth/login", { body: { username: $("#l-user").value, password: $("#l-pass").value } });
+      rememberUser($("#l-user").value);
+      enter(profile);
+    } catch (err) { $("#auth-error").textContent = err.message; }
+  });
 };
 
-$("#register-form").onsubmit = async (e) => {
+$("#register-form").onsubmit = (e) => {
   e.preventDefault();
-  try {
-    enter(await api("/api/auth/register", {
-      body: { displayName: $("#r-name").value, username: $("#r-user").value, password: $("#r-pass").value },
-    }));
-  } catch (err) { $("#auth-error").textContent = err.message; }
+  withBusy(e.currentTarget, async () => {
+    try {
+      const profile = await api("/api/auth/register", {
+        body: { displayName: $("#r-name").value, username: $("#r-user").value, password: $("#r-pass").value },
+      });
+      rememberUser($("#r-user").value);
+      enter(profile);
+    } catch (err) { $("#auth-error").textContent = err.message; }
+  });
 };
 
 function enter(profile) {
+  const cfg = lockConfig();
+  if (cfg && cfg.owner !== profile.key) clearLock();      // a lock left behind by a different account
   state.me = profile;
   paintAvatar($("#me-avatar"), profile.displayName, profile.key);
   $("#me-name").textContent = profile.displayName;
   $("#my-key").textContent = formatKey(profile.key);
+  $("#connecting").hidden = true;
   $("#auth").hidden = true;
   $("#app").hidden = false;
   connect();
@@ -133,21 +208,30 @@ document.addEventListener("click", (e) => {
   if (!e.target.closest("#attach-menu") && !e.target.closest("#attach-btn")) $("#attach-menu").hidden = true;
 });
 
-async function signOut() {
-  $("#menu").hidden = true;
+/* Back to the sign-in screen. The app lock setting is kept, because signing in again as the same person
+   should not make them set it up twice. */
+function resetToLogin(message) {
   endCall(null, true);
   dismissIncoming();
   closeChat();
   const ws = state.ws;
   state.me = null; state.ws = null;
   if (ws) ws.close();
-  clearLock();
   unlock();
+  $("#menu").hidden = true;
   $("#settings").hidden = true;
-  await api("/api/auth/logout", { body: {} }).catch(() => {});
+  $("#connecting").hidden = true;
   selectTab("login");
+  prefillUser();
   $("#app").hidden = true;
   $("#auth").hidden = false;
+  if (message) $("#auth-error").textContent = message;
+}
+
+async function signOut() {
+  clearLock();            // signing out on purpose also removes the lock from this device
+  resetToLogin();
+  await api("/api/auth/logout", { body: {}, tries: 6 }).catch(() => {});
 }
 $("#menu-logout").onclick = signOut;
 
@@ -1149,21 +1233,32 @@ $("#install-btn").onclick = async () => {
 };
 
 if ("serviceWorker" in navigator) {
-  window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => {}));
+  window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" }).catch(() => {}));
 }
 
 /* ---------- Start ---------- */
 
 function boot() {
-  const cfg = lockConfig();
-  if (cfg) lockApp();                      // a fresh open starts locked, before anything is shown
-  api("/api/me").then((profile) => {
-    if (cfg && cfg.owner !== profile.key) { clearLock(); unlock(); }   // the lock belonged to someone else
-    enter(profile);
-  }).catch((err) => {
-    if (err instanceof TypeError) { setTimeout(boot, 4000); flash("Cannot reach Zavelo. Trying again..."); return; }
-    clearLock(); unlock();                 // not signed in, so there is nothing to protect
-    $("#auth").hidden = false;
-  });
+  try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch { /* optional */ }
+  if (lockConfig()) lockApp();             // a fresh open starts locked, before anything is shown
+  loadSession();
+}
+
+/* Only a 401 from the server means "not signed in". A sleeping or unreachable server is never treated as a
+   sign-out: nothing is cleared, and we keep trying. */
+async function loadSession() {
+  try {
+    enter(await api("/api/me", { tries: 20 }));
+  } catch (err) {
+    if (err.status === 401) {
+      unlock();                            // nothing to protect while signed out; the lock setting is kept
+      $("#connecting").hidden = true;
+      $("#auth").hidden = false;
+      prefillUser();
+    } else {
+      $("#connecting-msg").textContent = "Cannot reach Zavelo. Trying again…";
+      setTimeout(loadSession, 5000);
+    }
+  }
 }
 boot();

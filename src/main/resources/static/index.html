@@ -275,6 +275,15 @@
     <button id="lock-forgot" class="linkbtn" type="button">Forgot it? Sign out</button>
   </section>
 
+  <!-- Shown while the server wakes up or the sign-in is being checked -->
+  <section id="connecting" class="overlay connecting">
+    <svg class="lock-logo" aria-hidden="true"><use href="#zv-icon"/></svg>
+    <h2>Zavelo</h2>
+    <p id="connecting-msg" role="status">Connecting…</p>
+    <div class="spinner" aria-hidden="true"></div>
+  </section>
+  <p id="waking" class="waking" role="status" hidden>Waking up Zavelo… this can take up to a minute.</p>
+
   <!-- Opening animation (about 4 seconds) -->
   <div id="splash" class="splash" role="presentation">
     <svg class="splash-icon" aria-hidden="true"><use href="#zv-icon"/></svg>
