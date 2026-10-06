@@ -89,19 +89,24 @@
         <strong id="my-key" class="key"></strong>
         <button id="copy-key" class="ibtn" aria-label="Copy my key"><svg class="ic"><use href="#i-copy"/></svg></button>
       </div>
+      <div id="notify-banner" class="notify-banner" hidden>
+        <span>Get notified when someone messages or calls you.</span>
+        <button id="notify-banner-on" class="primary" type="button">Turn on</button>
+        <button id="notify-banner-no" class="linkbtn" type="button">Not now</button>
+      </div>
       <form id="find-form" class="search">
         <svg class="ic"><use href="#i-search"/></svg>
         <input id="find-key" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Enter a key or username" maxlength="31" required aria-label="Key or username">
       </form>
       <p id="find-result" class="find-result" role="status"></p>
       <ul id="chat-list" class="chat-list"></ul>
-      <p id="chat-empty" class="hint" hidden>No chats yet. Enter a key or username  to start one.</p>
+      <p id="chat-empty" class="hint" hidden>No chats yet. Enter key or username above to start one.</p>
     </aside>
 
     <section class="pane">
       <div id="empty" class="empty">
         <h2>Zavelo</h2>
-        <p>Send messages to your friends and loved ones.</p>
+        <p>Send messages, voice notes and files, and call anyone .</p>
       </div>
 
       <div id="chat" class="chat" hidden>
@@ -215,13 +220,13 @@
 
       <form id="lock-setup" hidden>
         <p class="label">Unlock with</p>
-        <label class="choice"><input type="radio" name="lock-type" value="pin" checked> PIN </label>
+        <label class="choice"><input type="radio" name="lock-type" value="pin" checked> PIN (4 to 6 digits)</label>
         <label class="choice"><input type="radio" name="lock-type" value="password"> Password</label>
         <label for="lock-secret" id="lock-secret-label" class="label">New PIN</label>
         <input id="lock-secret" class="field" type="password" inputmode="numeric" maxlength="6" autocomplete="new-password">
         <label for="lock-confirm" class="label">Repeat it</label>
         <input id="lock-confirm" class="field" type="password" inputmode="numeric" maxlength="6" autocomplete="new-password">
-        <label id="bio-choice" class="choice" hidden><input type="checkbox" id="lock-bio"> unlock with fingerprint or face</label>
+        <label id="bio-choice" class="choice" hidden><input type="checkbox" id="lock-bio">Unlock with fingerprint or face</label>
         <p id="lock-error" class="error" role="alert"></p>
         <div class="btn-row">
           <button type="button" id="lock-cancel" class="ghost">Cancel</button>
@@ -231,7 +236,7 @@
 
       <form id="lock-verify" hidden>
         <label for="verify-secret" id="verify-label" class="label">Enter your PIN</label>
-        <input id="verify-secret" class="field" type="password" autocomplete="off">
+        <input id="verify-secret" class="field" type="password" autocomplete="off"> 
         <p id="verify-error" class="error" role="alert"></p>
         <div class="btn-row">
           <button type="button" id="verify-cancel" class="ghost">Cancel</button>
@@ -254,6 +259,12 @@
         </div>
         <button type="button" id="lock-disable" class="linkbtn">Turn off app lock</button>
       </div>
+
+      <hr>
+      <h3>Notifications</h3>
+      <p id="notify-text" class="hint"></p>
+      <button id="notify-btn" class="primary" type="button" hidden>Turn on notifications</button>
+      <button id="notify-test" class="ghost" type="button" hidden>Send a test notification</button>
 
       <hr>
       <h3>Install</h3>

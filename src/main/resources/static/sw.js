@@ -1,9 +1,9 @@
 // Zavelo service worker.
 // It lets the installed app open straight away from its saved copy, even while the server is asleep
 // or the phone is offline. Chats, files and calls are never stored here; they always go to the server.
-const CACHE = "zavelo-shell-v2";
+const CACHE = "zavelo-shell-v3";
 const SHELL = ["/", "/index.html", "/style.css", "/app.js", "/manifest.json", "/icon.svg",
-               "/icons/icon-192.png", "/icons/icon-512.png"];
+               "/icons/icon-192.png", "/icons/icon-512.png", "/icons/badge-96.png"];
 const WAIT_MS = 2500;   // how long to wait for the server before showing the saved copy
 
 self.addEventListener("install", (e) => {
@@ -64,4 +64,78 @@ self.addEventListener("fetch", (e) => {
   if (req.method !== "GET" || url.origin !== location.origin) return;
   if (url.pathname.startsWith("/api/") || url.pathname.startsWith("/ws/")) return;
   e.respondWith(handle(req));
+});
+
+/* ---------- Notifications ---------- */
+
+async function anyWindowVisible() {
+  const list = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  return list.some((c) => c.visibilityState === "visible");
+}
+
+async function showPush(d) {
+  const type = d.type || "message";
+  const from = d.test ? "" : (d.from || "");
+  const visible = await anyWindowVisible();
+
+  if (type === "call-end") {
+    // The caller gave up: stop showing "incoming call", and leave a "missed call" note.
+    (await self.registration.getNotifications({ tag: "call-" + from })).forEach((n) => n.close());
+    if (visible) return;
+  } else if (visible && !d.test) {
+    return;              // Zavelo is on screen, so the app itself already shows it
+  }
+
+  const call = type === "call";
+  const tag = d.test ? "test" : call ? "call-" + from : type === "call-end" ? "missed-" + from : "msg-" + from;
+  await self.registration.showNotification(d.title || "Zavelo", {
+    body: d.body || "",
+    tag,
+    renotify: true,
+    icon: "/icons/icon-192.png",
+    badge: "/icons/badge-96.png",
+    data: { from, type },
+    requireInteraction: call,                                   // a call stays until you answer or dismiss it
+    vibrate: call ? [400, 200, 400, 200, 400, 200, 400] : [150],
+  });
+}
+
+self.addEventListener("push", (e) => {
+  let d = {};
+  try { d = e.data ? e.data.json() : {}; } catch { d = { body: e.data ? e.data.text() : "" }; }
+  e.waitUntil(showPush(d));
+});
+
+self.addEventListener("notificationclick", (e) => {
+  e.notification.close();
+  const from = (e.notification.data || {}).from || "";
+  e.waitUntil((async () => {
+    const list = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    for (const c of list) {
+      if (new URL(c.url).origin !== self.location.origin) continue;
+      try { await c.focus(); } catch { /* already in front */ }
+      if (from) c.postMessage({ type: "open-chat", key: from });
+      return;
+    }
+    await self.clients.openWindow(from ? "/?chat=" + encodeURIComponent(from) : "/");
+  })());
+});
+
+function keyToBytes(k) {
+  const raw = atob((k + "=".repeat((4 - (k.length % 4)) % 4)).replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(raw, (ch) => ch.charCodeAt(0));
+}
+
+/* The browser sometimes replaces a phone's notification address. Sign it up again quietly. */
+self.addEventListener("pushsubscriptionchange", (e) => {
+  e.waitUntil((async () => {
+    try {
+      const { key } = await (await fetch("/api/push/key", { credentials: "same-origin" })).json();
+      const sub = await self.registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyToBytes(key) });
+      await fetch("/api/push/subscribe", {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(sub.toJSON()),
+      });
+    } catch { /* the page signs up again the next time Zavelo is opened */ }
+  })());
 });

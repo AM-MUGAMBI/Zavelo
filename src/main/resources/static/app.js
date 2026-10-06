@@ -191,7 +191,11 @@ function enter(profile) {
   $("#auth").hidden = true;
   $("#app").hidden = false;
   connect();
-  loadChats();
+  loadChats().then(() => {
+    if (pendingChatKey) { const k = pendingChatKey; pendingChatKey = null; openChatByKey(k); }
+  });
+  syncPush();
+  updateNotifyBanner();
 }
 
 /* ---------- Sidebar ---------- */
@@ -230,7 +234,9 @@ function resetToLogin(message) {
 
 async function signOut() {
   clearLock();            // signing out on purpose also removes the lock from this device
+  const detach = detachDevice();   // stop notifications for this account on this phone, while still signed in
   resetToLogin();
+  await detach.catch(() => {});
   await api("/api/auth/logout", { body: {}, tries: 6 }).catch(() => {});
 }
 $("#menu-logout").onclick = signOut;
@@ -278,6 +284,7 @@ function renderChats() {
 async function openChat(key, displayName) {
   cancelRecording();
   state.chat = { key, displayName };
+  closeNotifications("msg-" + key);
   state.lastDay = null;
   state.seen = new Set();
   paintAvatar($("#chat-avatar"), displayName, key);
@@ -796,6 +803,8 @@ async function startCall(type) {
 }
 
 async function onOffer(from, p) {
+  // The server hands a still-ringing call to a tab that has just (re)connected; ignore it if we already have it.
+  if ((incoming && incoming.peer === from) || (call && call.role === "callee" && call.peer === from)) return;
   if (call || incoming) { sendSignal(from, { kind: "reject", reason: "busy" }); return; }
   const type = p.callType === "video" ? "video" : "voice";
   const inc = { peer: from, name: formatKey(from), type, offer: p.sdp, ice: [] };
@@ -887,9 +896,11 @@ function endCall(reason, notifyPeer) {
 }
 
 function dismissIncoming() {
+  const peer = incoming && incoming.peer;
   incoming = null;
   stopRinging();
   $("#incoming").hidden = true;
+  if (peer) closeNotifications("call-" + peer);
 }
 
 $("#voice-call").onclick = () => startCall("voice");
@@ -1121,6 +1132,7 @@ async function openSettings() {
   $("#menu").hidden = true;
   $("#settings").hidden = false;
   renderLockSettings();
+  renderNotifySettings();
   refreshInstallRow();
   bioAvailable = await biometricAvailable();
   $("#bio-choice").hidden = !bioAvailable;
@@ -1235,6 +1247,165 @@ $("#install-btn").onclick = async () => {
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" }).catch(() => {}));
 }
+
+/* ---------- Notifications ---------- */
+
+let pendingChatKey = null;
+{ // opened from a notification while Zavelo was closed: /?chat=<key>
+  const q = new URLSearchParams(location.search).get("chat");
+  if (q && /^\d{9}$/.test(q)) { pendingChatKey = q; try { history.replaceState(null, "", location.pathname); } catch { /* optional */ } }
+}
+
+const pushSupported = () => "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+const isIos = () => /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
+function keyToBytes(k) {
+  const raw = atob((k + "=".repeat((4 - (k.length % 4)) % 4)).replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(raw, (ch) => ch.charCodeAt(0));
+}
+function bytesToKey(buf) {
+  let s = "";
+  new Uint8Array(buf).forEach((b) => (s += String.fromCharCode(b)));
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function swReady() {
+  return Promise.race([
+    navigator.serviceWorker.ready,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("Zavelo is still starting. Try again in a moment.")), 8000)),
+  ]);
+}
+
+async function currentSubscription() {
+  if (!pushSupported()) return null;
+  try { return await (await swReady()).pushManager.getSubscription(); } catch { return null; }
+}
+
+/* Sign this phone up (or refresh its sign-up) for the account that is signed in. */
+async function subscribeThisDevice() {
+  const reg = await swReady();
+  const { key } = await api("/api/push/key");
+  let sub = await reg.pushManager.getSubscription();
+  if (sub && sub.options && sub.options.applicationServerKey && bytesToKey(sub.options.applicationServerKey) !== key) {
+    await sub.unsubscribe();               // the server's key changed, so the old sign-up can no longer be used
+    sub = null;
+  }
+  if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyToBytes(key) });
+  await api("/api/push/subscribe", { body: sub.toJSON() });
+  return sub;
+}
+
+async function enableNotifications() {
+  if (!pushSupported()) { flash("This browser can't show notifications."); return false; }
+  try {
+    let permission = Notification.permission;
+    if (permission === "default") permission = await Notification.requestPermission();   // must run straight from a tap
+    if (permission !== "granted") {
+      flash("Notifications are blocked. Allow them for Zavelo in your browser settings.");
+      return false;
+    }
+    await subscribeThisDevice();
+    flash("Notifications are on");
+    return true;
+  } catch (e) {
+    flash(e.message || "Could not turn on notifications.");
+    return false;
+  } finally {
+    renderNotifySettings();
+    updateNotifyBanner();
+  }
+}
+
+async function detachDevice() {
+  const sub = await currentSubscription();
+  if (!sub) return;
+  await api("/api/push/unsubscribe", { body: { endpoint: sub.endpoint }, tries: 2 }).catch(() => {});
+  await sub.unsubscribe().catch(() => {});
+}
+
+async function disableNotifications() {
+  await detachDevice();
+  renderNotifySettings();
+  updateNotifyBanner();
+}
+
+/* Each time Zavelo opens, make sure the server has this phone's current address under the signed-in account. */
+function syncPush() {
+  if (pushSupported() && Notification.permission === "granted") subscribeThisDevice().catch(() => {});
+}
+
+async function renderNotifySettings() {
+  const text = $("#notify-text"), btn = $("#notify-btn"), test = $("#notify-test");
+  btn.hidden = true; test.hidden = true;
+  if (!pushSupported()) {
+    const standalone = window.matchMedia("(display-mode: standalone)").matches || navigator.standalone;
+    text.textContent = isIos() && !standalone
+      ? "On iPhone, first add Zavelo to your Home Screen (Share, then Add to Home Screen), then open it from there to turn notifications on."
+      : "This browser can't show notifications.";
+    return;
+  }
+  if (Notification.permission === "denied") {
+    text.textContent = "Notifications are blocked for Zavelo. Allow them in your browser or phone settings, then come back here.";
+    return;
+  }
+  const sub = Notification.permission === "granted" ? await currentSubscription() : null;
+  btn.hidden = false;
+  if (sub) {
+    text.textContent = "You'll get a notification for new messages and calls on this device, even when Zavelo is closed.";
+    btn.textContent = "Turn off notifications";
+    btn.dataset.mode = "off";
+    test.hidden = false;
+  } else {
+    text.textContent = "Get a notification when someone messages or calls you, even when Zavelo is closed.";
+    btn.textContent = "Turn on notifications";
+    btn.dataset.mode = "on";
+  }
+}
+$("#notify-btn").onclick = async () => {
+  if ($("#notify-btn").dataset.mode === "off") await disableNotifications();
+  else await enableNotifications();
+};
+$("#notify-test").onclick = async () => {
+  try { await api("/api/push/test", { body: {} }); flash("Sent. It should arrive in a moment."); }
+  catch (e) { flash(e.message); }
+};
+
+const bannerDismissed = () => { try { return localStorage.getItem("zavelo.notify.dismissed") === "1"; } catch { return false; } };
+function updateNotifyBanner() {
+  $("#notify-banner").hidden = !(state.me && pushSupported() && Notification.permission === "default" && !bannerDismissed());
+}
+$("#notify-banner-on").onclick = enableNotifications;
+$("#notify-banner-no").onclick = () => {
+  try { localStorage.setItem("zavelo.notify.dismissed", "1"); } catch { /* optional */ }
+  updateNotifyBanner();
+};
+
+async function closeNotifications(tag) {
+  try {
+    if (!("serviceWorker" in navigator)) return;
+    const reg = await navigator.serviceWorker.getRegistration();
+    if (reg) (await reg.getNotifications({ tag })).forEach((n) => n.close());
+  } catch { /* optional */ }
+}
+
+async function openChatByKey(key) {
+  if (!/^\d{9}$/.test(key)) return;
+  if (!state.me) { pendingChatKey = key; return; }
+  const known = state.chats.find((c) => c.key === key);
+  let name = known ? known.displayName : null;
+  if (!name) { try { name = (await api(`/api/users/by-key/${key}`)).displayName; } catch { return; } }
+  openChat(key, name);
+}
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.addEventListener("message", (e) => {
+    if (e.data && e.data.type === "open-chat") openChatByKey(String(e.data.key));
+  });
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && state.chat) closeNotifications("msg-" + state.chat.key);
+});
 
 /* ---------- Start ---------- */
 
