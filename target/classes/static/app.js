@@ -1,0 +1,1435 @@
+const $ = (s) => document.querySelector(s);
+const state = { me: null, chat: null, chats: [], ws: null, retries: 0, lastDay: null, seen: new Set() };
+const MAX_FILE = 10 * 1024 ** 3;   // 10 GB, the same limit the server enforces
+
+/* ---------- Helpers ---------- */
+
+const formatKey = (k) => k.replace(/(\d{3})(?=\d)/g, "$1 ");
+const timeOf = (iso) => new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+const mmss = (sec) => `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, "0")}`;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function formatSize(bytes) {
+  const units = ["B", "KB", "MB", "GB"];
+  let i = 0, n = bytes;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return `${n >= 10 || i === 0 ? Math.round(n) : n.toFixed(1)} ${units[i]}`;
+}
+
+function dayLabel(date) {
+  if (date.toDateString() === new Date().toDateString()) return "Today";
+  if (date.toDateString() === new Date(Date.now() - 864e5).toDateString()) return "Yesterday";
+  return date.toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" });
+}
+
+function el(tag, props = {}, ...children) {
+  const node = Object.assign(document.createElement(tag), props);
+  node.append(...children);
+  return node;
+}
+
+function icon(id) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "ic");
+  svg.setAttribute("aria-hidden", "true");
+  svg.innerHTML = `<use href="#${id}"/>`;
+  return svg;
+}
+
+const setIcon = (btn, id) => btn.querySelector("use").setAttribute("href", "#" + id);
+
+function paintAvatar(node, name, key) {
+  node.textContent = (name.trim()[0] || "?").toUpperCase();
+  const hue = 170 + (parseInt(key.slice(-3), 10) % 70);      // blues and teals
+  node.style.background = `hsl(${hue} 55% 38%)`;
+}
+
+function flash(text) {
+  const t = $("#toast");
+  t.textContent = text;
+  t.hidden = false;
+  clearTimeout(flash.timer);
+  flash.timer = setTimeout(() => (t.hidden = true), 3500);
+}
+
+class ApiError extends Error {
+  constructor(message, status) { super(message); this.status = status; }
+}
+
+/* While Render wakes a sleeping server it answers with its own page or a 502/503. Zavelo did not see
+   those requests, so it is safe to wait and ask again instead of showing an error. */
+const isWakingReply = (res) => res.status === 502 || res.status === 503 || res.status === 504 ||
+  (res.ok && !(res.headers.get("content-type") || "").includes("json"));
+
+function setWaking(on) {
+  if (!$("#connecting").hidden) {
+    $("#connecting-msg").textContent = on ? "Waking up Zavelo… this can take up to a minute." : "Connecting…";
+  } else {
+    $("#waking").hidden = !on;
+  }
+}
+
+async function api(path, options = {}) {
+  const method = options.method || (options.body ? "POST" : "GET");
+  const maxTries = options.tries ?? 12;
+  const init = {
+    method,
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: options.body ? JSON.stringify(options.body) : undefined,
+  };
+
+  for (let attempt = 1; ; attempt++) {
+    let res;
+    try {
+      res = await fetch(path, init);
+    } catch {
+      // The request may or may not have arrived, so only reads are repeated automatically.
+      if (method === "GET" && attempt < maxTries) { setWaking(true); await sleep(Math.min(1500 * attempt, 6000)); continue; }
+      setWaking(false);
+      throw new ApiError("Cannot reach Zavelo. Check your internet connection and try again.", 0);
+    }
+
+    if (isWakingReply(res)) {
+      // 504 can mean the server did get the request, so only reads are repeated after a 504.
+      if (attempt < maxTries && (method === "GET" || res.status !== 504)) {
+        setWaking(true);
+        await sleep(Math.min(1500 * attempt, 6000));
+        continue;
+      }
+      setWaking(false);
+      throw new ApiError("Zavelo is still starting up. Wait a few seconds and try again.", res.ok ? 503 : res.status);
+    }
+    setWaking(false);
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      if (res.status === 401 && state.me && !path.startsWith("/api/auth/")) resetToLogin("You were signed out. Please sign in again.");
+      throw new ApiError(data.message || "Something went wrong. Try again.", res.status);
+    }
+    return data;
+  }
+}
+
+function mediaError(e) {
+  if (!navigator.mediaDevices) return "Calls and recording need HTTPS (or localhost).";
+  if (e && e.name === "NotAllowedError") return "Allow microphone and camera access in your browser, then try again.";
+  if (e && e.name === "NotFoundError") return "No microphone or camera found.";
+  return "Could not start the microphone or camera.";
+}
+
+function fileKind(mime) {
+  if (/^image\//.test(mime)) return "image";
+  if (/^video\//.test(mime)) return "video";
+  if (/^audio\//.test(mime)) return "audio";
+  return "doc";
+}
+
+/* ---------- Sign in / create account ---------- */
+
+function selectTab(name) {
+  const login = name === "login";
+  $("#login-form").hidden = !login;
+  $("#register-form").hidden = login;
+  $("#tab-login").setAttribute("aria-selected", login);
+  $("#tab-register").setAttribute("aria-selected", !login);
+  $("#auth-error").textContent = "";
+}
+
+$("#tab-login").onclick = () => selectTab("login");
+$("#tab-register").onclick = () => selectTab("register");
+
+/* Stops a second tap from sending the form twice while a slow server is waking up */
+async function withBusy(form, work) {
+  const btn = form.querySelector('button[type="submit"]');
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Please wait…";
+  try { return await work(); } finally { btn.disabled = false; btn.textContent = label; }
+}
+
+function rememberUser(name) { try { localStorage.setItem("zavelo.lastUser", name.trim()); } catch { /* optional */ } }
+function prefillUser() {
+  try {
+    const name = localStorage.getItem("zavelo.lastUser");
+    if (name && !$("#l-user").value) $("#l-user").value = name;
+  } catch { /* optional */ }
+}
+
+$("#login-form").onsubmit = (e) => {
+  e.preventDefault();
+  withBusy(e.currentTarget, async () => {
+    try {
+      const profile = await api("/api/auth/login", { body: { username: $("#l-user").value, password: $("#l-pass").value } });
+      rememberUser($("#l-user").value);
+      enter(profile);
+    } catch (err) { $("#auth-error").textContent = err.message; }
+  });
+};
+
+$("#register-form").onsubmit = (e) => {
+  e.preventDefault();
+  withBusy(e.currentTarget, async () => {
+    try {
+      const profile = await api("/api/auth/register", {
+        body: { displayName: $("#r-name").value, username: $("#r-user").value, password: $("#r-pass").value },
+      });
+      rememberUser($("#r-user").value);
+      enter(profile);
+    } catch (err) { $("#auth-error").textContent = err.message; }
+  });
+};
+
+function enter(profile) {
+  const cfg = lockConfig();
+  if (cfg && cfg.owner !== profile.key) clearLock();      // a lock left behind by a different account
+  state.me = profile;
+  paintAvatar($("#me-avatar"), profile.displayName, profile.key);
+  $("#me-name").textContent = profile.displayName;
+  $("#my-key").textContent = formatKey(profile.key);
+  $("#connecting").hidden = true;
+  $("#auth").hidden = true;
+  $("#app").hidden = false;
+  connect();
+  loadChats().then(() => {
+    if (pendingChatKey) { const k = pendingChatKey; pendingChatKey = null; openChatByKey(k); }
+  });
+  syncPush();
+  updateNotifyBanner();
+}
+
+/* ---------- Sidebar ---------- */
+
+async function copyKey() {
+  await navigator.clipboard.writeText(state.me.key);
+  flash("Key copied");
+}
+$("#copy-key").onclick = copyKey;
+$("#menu-copy").onclick = () => { $("#menu").hidden = true; copyKey(); };
+$("#menu-btn").onclick = (e) => { e.stopPropagation(); $("#menu").hidden = !$("#menu").hidden; };
+document.addEventListener("click", (e) => {
+  if (!e.target.closest("#menu")) $("#menu").hidden = true;
+  if (!e.target.closest("#attach-menu") && !e.target.closest("#attach-btn")) $("#attach-menu").hidden = true;
+});
+
+/* Back to the sign-in screen. The app lock setting is kept, because signing in again as the same person
+   should not make them set it up twice. */
+function resetToLogin(message) {
+  endCall(null, true);
+  dismissIncoming();
+  closeChat();
+  const ws = state.ws;
+  state.me = null; state.ws = null;
+  if (ws) ws.close();
+  unlock();
+  $("#menu").hidden = true;
+  $("#settings").hidden = true;
+  $("#connecting").hidden = true;
+  selectTab("login");
+  prefillUser();
+  $("#app").hidden = true;
+  $("#auth").hidden = false;
+  if (message) $("#auth-error").textContent = message;
+}
+
+async function signOut() {
+  clearLock();            // signing out on purpose also removes the lock from this device
+  const detach = detachDevice();   // stop notifications for this account on this phone, while still signed in
+  resetToLogin();
+  await detach.catch(() => {});
+  await api("/api/auth/logout", { body: {}, tries: 6 }).catch(() => {});
+}
+$("#menu-logout").onclick = signOut;
+
+$("#find-key").oninput = (e) => {
+  const v = e.target.value;
+  // Looks like a key (only digits and spaces): group the digits. Otherwise it's a username: leave it alone.
+  if (/^[\d\s]+$/.test(v)) e.target.value = formatKey(v.replace(/\D/g, "").slice(0, 9));
+};
+
+$("#find-form").onsubmit = async (e) => {
+  e.preventDefault();
+  const out = $("#find-result");
+  try {
+    const user = await api(`/api/users/search?q=${encodeURIComponent($("#find-key").value.trim())}`);
+    const btn = el("button", { type: "button", textContent: "Message" });
+    btn.onclick = () => { out.textContent = ""; $("#find-key").value = ""; openChat(user.key, user.displayName); };
+    out.replaceChildren("Found ", el("strong", { textContent: user.displayName }), ` (@${user.username})`, btn);
+  } catch (err) { out.textContent = err.message; }
+};
+
+async function loadChats() {
+  try { state.chats = await api("/api/chats"); renderChats(); } catch { /* refreshes on the next message */ }
+}
+
+function renderChats() {
+  $("#chat-list").replaceChildren(...state.chats.map((c) => {
+    const av = el("div", { className: "avatar" });
+    paintAvatar(av, c.displayName, c.key);
+    const btn = el("button", { className: "chat-item" + (state.chat && state.chat.key === c.key ? " active" : "") },
+      av,
+      el("div", { className: "body" },
+        el("div", { className: "r1" },
+          el("span", { className: "name ellipsis", textContent: c.displayName }),
+          el("span", { className: "when", textContent: timeOf(c.sentAt) })),
+        el("div", { className: "preview ellipsis", textContent: c.lastMessage })));
+    btn.onclick = () => openChat(c.key, c.displayName);
+    return el("li", {}, btn);
+  }));
+  $("#chat-empty").hidden = state.chats.length > 0;
+}
+
+/* ---------- Conversation ---------- */
+
+async function openChat(key, displayName) {
+  cancelRecording();
+  state.chat = { key, displayName };
+  closeNotifications("msg-" + key);
+  state.lastDay = null;
+  state.seen = new Set();
+  paintAvatar($("#chat-avatar"), displayName, key);
+  $("#chat-title").textContent = displayName;
+  $("#chat-key").textContent = formatKey(key);
+  $("#emoji-panel").hidden = true;
+  $("#attach-menu").hidden = true;
+  $("#messages").replaceChildren();
+  $("#empty").hidden = true;
+  $("#chat").hidden = false;
+  $("#app").classList.add("in-chat");
+  renderChats();
+  try {
+    (await api(`/api/messages/${key}`)).forEach(appendMessage);
+  } catch (err) { flash(err.message); }
+  $("#send-input").focus();
+}
+
+function closeChat() {
+  cancelRecording();
+  stopAllAudio();
+  state.chat = null;
+  $("#chat").hidden = true;
+  $("#empty").hidden = false;
+  $("#app").classList.remove("in-chat");
+  renderChats();
+}
+$("#back").onclick = closeChat;
+
+function showIfOpen(m) {
+  const other = m.from === state.me.key ? m.to : m.from;
+  if (state.chat && state.chat.key === other) appendMessage(m);
+  loadChats();
+}
+
+function appendMessage(m) {
+  if (state.seen.has(m.id)) return;           // the same message can arrive twice (upload reply + live push)
+  state.seen.add(m.id);
+
+  const list = $("#messages");
+  const date = new Date(m.sentAt);
+  if (date.toDateString() !== state.lastDay) {
+    state.lastDay = date.toDateString();
+    list.append(el("li", { className: "day", textContent: dayLabel(date) }));
+  }
+  const mine = m.from === state.me.key;
+  const media = m.type === "file" && ["image", "video"].includes(fileKind(m.fileMime));
+  // textContent, never innerHTML: a message can't inject code.
+  const content = m.type === "audio" ? voicePlayer(m)
+    : m.type === "file" ? fileBubble(m)
+    : el("span", { textContent: m.body });
+  list.append(el("li", { className: `msg ${mine ? "mine" : "theirs"}${media ? " has-media" : ""}` },
+    content, el("span", { className: "time", textContent: timeOf(m.sentAt) })));
+  list.scrollTop = list.scrollHeight;
+}
+
+/* Send text, or record a voice note when the box is empty (like WhatsApp) */
+
+const input = $("#send-input");
+input.oninput = () => {
+  const typing = input.value.trim().length > 0;
+  setIcon($("#action-btn"), typing ? "i-send" : "i-mic");
+  $("#action-btn").setAttribute("aria-label", typing ? "Send message" : "Record a voice note");
+};
+
+$("#send-form").onsubmit = (e) => {
+  e.preventDefault();
+  const body = input.value.trim();
+  if (!body) { startRecording(); return; }
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) { flash("Reconnecting. Send again in a moment."); return; }
+  state.ws.send(JSON.stringify({ to: state.chat.key, body }));
+  input.value = "";
+  input.oninput();
+  $("#emoji-panel").hidden = true;
+};
+
+/* ---------- Emojis ---------- */
+
+const EMOJIS = {
+  Faces: "😀 😃 😄 😁 😆 😅 😂 🤣 😊 😇 🙂 😉 😍 🥰 😘 😋 😎 🤩 🥳 😏 😌 😴 🤔 🤗 😮 😢 😭 😡 🥺 😱 🙄 😬",
+  Hands: "👍 👎 👏 🙌 🙏 💪 👋 🤝 ✌️ 🤞 👌 🫶 ☝️ 👀",
+  Hearts: "❤️ 🧡 💛 💚 💙 💜 🖤 🤍 💔 💕 💖 💯 🔥 ✨ 🎉 🎁",
+  Things: "📞 🎤 🎧 📷 💬 ✅ ❌ ⭐ 🌍 🌞 🌙 ☕ 🍕 🎂 ⚽ 🚀",
+};
+
+(function buildEmojiPanel() {
+  const panel = $("#emoji-panel");
+  for (const [group, list] of Object.entries(EMOJIS)) {
+    const grid = el("div", { className: "emoji-grid" });
+    for (const emoji of list.split(" ")) {
+      const b = el("button", { type: "button", textContent: emoji });
+      b.setAttribute("aria-label", "Insert " + emoji);
+      b.onclick = () => insertAtCursor(input, emoji);
+      grid.append(b);
+    }
+    panel.append(el("p", { className: "label", textContent: group }), grid);
+  }
+})();
+
+function insertAtCursor(box, text) {
+  const start = box.selectionStart ?? box.value.length;
+  const end = box.selectionEnd ?? start;
+  box.value = box.value.slice(0, start) + text + box.value.slice(end);
+  box.setSelectionRange(start + text.length, start + text.length);
+  box.focus();
+  box.oninput && box.oninput();
+}
+
+$("#emoji-btn").onclick = () => { $("#attach-menu").hidden = true; $("#emoji-panel").hidden = !$("#emoji-panel").hidden; };
+
+/* ---------- Voice notes ---------- */
+
+const rec = { recorder: null, stream: null, chunks: [], startedAt: 0, timer: null, send: false };
+const MAX_VOICE_SECONDS = 300;
+const AUDIO_TYPES = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
+
+async function startRecording() {
+  if (rec.recorder) return;
+  if (!navigator.mediaDevices || !window.MediaRecorder) { flash(mediaError()); return; }
+  try {
+    rec.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) { flash(mediaError(e)); return; }
+
+  const mimeType = AUDIO_TYPES.find((t) => MediaRecorder.isTypeSupported(t));
+  rec.recorder = new MediaRecorder(rec.stream, mimeType ? { mimeType } : undefined);
+  rec.chunks = [];
+  rec.send = false;
+  rec.recorder.ondataavailable = (e) => e.data.size && rec.chunks.push(e.data);
+  rec.recorder.onstop = finishRecording;
+  rec.recorder.start();
+  rec.startedAt = Date.now();
+
+  $("#send-form").hidden = true;
+  $("#emoji-panel").hidden = true;
+  $("#recorder").hidden = false;
+  $("#rec-time").textContent = "0:00";
+  rec.timer = setInterval(() => {
+    const secs = (Date.now() - rec.startedAt) / 1000;
+    $("#rec-time").textContent = mmss(secs);
+    if (secs >= MAX_VOICE_SECONDS) stopRecording(true);
+  }, 250);
+}
+
+function stopRecording(send) {
+  if (!rec.recorder || rec.recorder.state === "inactive") return;
+  rec.send = send;
+  rec.recorder.stop();
+}
+const cancelRecording = () => stopRecording(false);
+
+async function finishRecording() {
+  clearInterval(rec.timer);
+  rec.stream.getTracks().forEach((t) => t.stop());
+  $("#recorder").hidden = true;
+  $("#send-form").hidden = false;
+
+  const seconds = Math.round((Date.now() - rec.startedAt) / 1000);
+  const type = (rec.recorder.mimeType || "audio/webm").split(";")[0];
+  const chunks = rec.chunks;
+  const send = rec.send;
+  rec.recorder = null;
+  if (!send || !state.chat) return;
+  if (seconds < 1) { flash("Hold on a little longer to record."); return; }
+
+  const form = new FormData();
+  form.append("file", new File(chunks, "voice", { type }));
+  form.append("to", state.chat.key);
+  form.append("duration", seconds);
+  try {
+    const res = await fetch("/api/voice", { method: "POST", body: form, credentials: "same-origin" });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).message || "Could not send the voice note.");
+    showIfOpen(await res.json());
+  } catch (err) { flash(err.message); }
+}
+
+$("#rec-cancel").onclick = cancelRecording;
+$("#rec-send").onclick = () => stopRecording(true);
+
+let playing = null;
+function stopAllAudio() { if (playing) { playing.pause(); playing = null; } }
+
+function voicePlayer(m) {
+  const audio = new Audio(`/api/voice/${m.id}`);
+  audio.preload = "none";
+  const play = el("button", { type: "button", className: "play" }, icon("i-play"));
+  play.setAttribute("aria-label", "Play voice note");
+  const fill = el("div", { className: "fill" });
+  const dur = el("span", { className: "dur", textContent: mmss(m.duration || 0) });
+  const swap = (id) => play.replaceChildren(icon(id));
+
+  play.onclick = () => {
+    if (audio.paused) { stopAllAudio(); playing = audio; audio.play().catch(() => flash("Could not play this voice note.")); }
+    else audio.pause();
+  };
+  audio.onplay = () => swap("i-pause");
+  audio.onpause = () => swap("i-play");
+  audio.onended = () => { swap("i-play"); fill.style.width = "0"; dur.textContent = mmss(m.duration || 0); };
+  audio.ontimeupdate = () => {
+    const total = m.duration || audio.duration || 1;
+    fill.style.width = Math.min(100, (audio.currentTime / total) * 100) + "%";
+    dur.textContent = mmss(audio.currentTime);
+  };
+  return el("div", { className: "voice" }, play, el("div", { className: "bar2" }, fill), dur);
+}
+
+/* ---------- Sending files (images, videos, audio, documents, up to 10 GB) ---------- */
+
+const PICKERS = { media: "#pick-media", doc: "#pick-doc", audio: "#pick-audio" };
+
+$("#attach-btn").onclick = () => { $("#emoji-panel").hidden = true; $("#attach-menu").hidden = !$("#attach-menu").hidden; };
+document.querySelectorAll("#attach-menu button").forEach((b) => {
+  b.onclick = () => { $("#attach-menu").hidden = true; $(PICKERS[b.dataset.pick]).click(); };
+});
+Object.values(PICKERS).forEach((sel) => {
+  $(sel).onchange = (e) => {
+    const file = e.target.files[0];
+    e.target.value = "";                     // lets the same file be chosen again later
+    if (file) openPreview(file);
+  };
+});
+
+function docCard(name, size, mime) {
+  const kind = fileKind(mime);
+  return el("div", { className: "doc" },
+    el("div", { className: "ficon" }, icon(kind === "audio" ? "i-audio" : "i-file")),
+    el("div", { className: "meta" },
+      el("span", { className: "fname ellipsis", textContent: name }),
+      el("span", { className: "fsize", textContent: formatSize(size) })));
+}
+
+let previewFile = null, previewUrl = null;
+
+function openPreview(file) {
+  if (file.size === 0) { flash("That file is empty."); return; }
+  if (file.size > MAX_FILE) { flash("Files can be up to 10 GB."); return; }
+  previewFile = file;
+  const body = $("#preview-body");
+  const kind = fileKind(file.type);
+  const fallback = () => body.replaceChildren(docCard(file.name, file.size, file.type));
+  if (kind === "image" || kind === "video") {
+    previewUrl = URL.createObjectURL(file);
+    const node = kind === "image" ? el("img", { src: previewUrl, alt: file.name }) : el("video", { src: previewUrl, controls: true });
+    node.onerror = fallback;                 // e.g. a format this browser can't show
+    body.replaceChildren(node);
+  } else fallback();
+  $("#preview-name").textContent = file.name;
+  $("#preview-size").textContent = formatSize(file.size);
+  $("#preview-caption").value = "";
+  $("#preview").hidden = false;
+  $("#preview-caption").focus();
+}
+
+function closePreview() {
+  $("#preview").hidden = true;
+  $("#preview-body").replaceChildren();
+  if (previewUrl) URL.revokeObjectURL(previewUrl);
+  previewUrl = null; previewFile = null;
+}
+$("#preview-close").onclick = closePreview;
+$("#preview-form").onsubmit = (e) => {
+  e.preventDefault();
+  const file = previewFile, caption = $("#preview-caption").value.trim();
+  closePreview();
+  if (file) sendFile(file, caption);
+};
+
+/* A progress bubble in the chat while the file goes up. */
+function pendingBubble(file, retry) {
+  const bar = el("div");
+  const status = el("span", { textContent: "Starting…" });
+  const cancel = el("button", { type: "button", textContent: "Cancel" });
+  const ui = { cancelled: false, xhr: null, uploadId: null };
+  const li = el("li", { className: "msg mine pending" },
+    el("div", {},
+      docCard(file.name, file.size, file.type),
+      el("div", { className: "progress" }, bar),
+      el("div", { className: "state" }, status, cancel)));
+  cancel.onclick = () => {
+    ui.cancelled = true;
+    if (ui.xhr) ui.xhr.abort();
+    if (ui.uploadId) api(`/api/files/${ui.uploadId}`, { method: "DELETE" }).catch(() => {});
+    li.remove();
+  };
+  ui.progress = (sent) => {
+    const pct = Math.min(100, (sent / file.size) * 100);
+    bar.style.width = pct + "%";
+    status.textContent = `${formatSize(Math.min(sent, file.size))} of ${formatSize(file.size)}`;
+  };
+  ui.fail = (message) => {
+    const again = el("button", { type: "button", textContent: "Try again" });
+    again.onclick = () => { li.remove(); retry(); };
+    status.textContent = message;
+    cancel.replaceWith(again);
+  };
+  ui.remove = () => li.remove();
+  if (state.chat) { $("#messages").append(li); $("#messages").scrollTop = $("#messages").scrollHeight; }
+  return ui;
+}
+
+async function sendFile(file, caption) {
+  if (!state.chat) return;
+  const to = state.chat.key;
+  const ui = pendingBubble(file, () => sendFile(file, caption));
+  try {
+    const message = await uploadFile(file, caption, to, ui);
+    ui.remove();
+    showIfOpen(message);
+  } catch (err) {
+    if (ui.cancelled) ui.remove(); else ui.fail(err.message);
+  }
+}
+
+/* The file goes up in 8 MB pieces. If the connection drops, only the current piece is repeated,
+   starting from wherever the server says it got to. */
+async function uploadFile(file, caption, to, ui) {
+  const init = await api("/api/files/init", { body: { to, name: file.name, size: file.size, mime: file.type, caption } });
+  ui.uploadId = init.uploadId;
+  let received = 0, failures = 0;
+
+  while (received < file.size) {
+    if (ui.cancelled) throw new Error("Cancelled");
+    const end = Math.min(received + init.chunkSize, file.size);
+    try {
+      const base = received;
+      const reply = await putPiece(init.uploadId, base, file.slice(base, end), (loaded) => ui.progress(base + loaded), ui);
+      received = reply.received;
+      failures = 0;
+    } catch (err) {
+      if (ui.cancelled) throw err;
+      if (++failures > 8) throw new Error("Upload failed. Check your connection.");
+      await sleep(Math.min(1000 * 2 ** failures, 15000));
+      try { received = (await api(`/api/files/${init.uploadId}/status`)).received; } catch { /* try again next loop */ }
+    }
+  }
+  return api(`/api/files/${init.uploadId}/complete`, { body: {} });
+}
+
+function putPiece(uploadId, offset, blob, onProgress, ui) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    ui.xhr = xhr;
+    xhr.open("PUT", `/api/files/${uploadId}?offset=${offset}`);
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.upload.onprogress = (e) => onProgress(e.loaded);
+    xhr.onload = () => (xhr.status >= 200 && xhr.status < 300
+      ? resolve(JSON.parse(xhr.responseText)) : reject(new Error("HTTP " + xhr.status)));
+    xhr.onerror = () => reject(new Error("Network error"));
+    xhr.onabort = () => reject(new Error("Cancelled"));
+    xhr.send(blob);
+  });
+}
+
+/* How a received file looks in the chat */
+function fileBubble(m) {
+  const url = `/api/files/${m.id}`;
+  const download = `${url}?download=true`;
+  const kind = fileKind(m.fileMime);
+  const wrap = el("div", { className: "attach" });
+
+  if (kind === "image") {
+    const img = el("img", { src: url, alt: m.fileName, loading: "lazy" });
+    img.onclick = () => openViewer(url, download, m.fileName);
+    wrap.append(img);
+  } else if (kind === "video") {
+    wrap.append(el("video", { src: url, controls: true, preload: "metadata" }));
+  } else {
+    const card = docCard(m.fileName, m.fileSize, m.fileMime);
+    const link = el("a", { href: download, className: "ibtn", download: m.fileName }, icon("i-download"));
+    link.setAttribute("aria-label", "Download " + m.fileName);
+    card.append(link);
+    wrap.append(card);
+    if (kind === "audio") wrap.append(el("audio", { src: url, controls: true, preload: "none" }));
+  }
+  if (m.body) wrap.append(el("span", { className: "caption", textContent: m.body }));
+  return wrap;
+}
+
+function openViewer(url, download, name) {
+  $("#viewer-img").src = url;
+  $("#viewer-name").textContent = name;
+  $("#viewer-download").href = download;
+  $("#viewer-download").setAttribute("download", name);
+  $("#viewer").hidden = false;
+}
+function closeViewer() { $("#viewer").hidden = true; $("#viewer-img").removeAttribute("src"); }
+$("#viewer-close").onclick = closeViewer;
+
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  closeViewer(); closePreview();
+  $("#emoji-panel").hidden = true; $("#attach-menu").hidden = true; $("#menu").hidden = true;
+});
+
+/* ---------- Live connection ---------- */
+
+function connect() {
+  if (state.ws) return;
+  const scheme = location.protocol === "https:" ? "wss://" : "ws://";
+  const ws = new WebSocket(scheme + location.host + "/ws/chat");
+  state.ws = ws;
+  ws.onopen = () => { state.retries = 0; };
+  ws.onmessage = (e) => onSocket(JSON.parse(e.data));
+  ws.onclose = () => {
+    if (state.ws === ws) state.ws = null;
+    if (state.me) setTimeout(connect, Math.min(1000 * 2 ** state.retries++, 15000));
+  };
+}
+
+function onSocket(msg) {
+  if (msg.error) { flash(msg.error); return; }
+  if (msg.type === "signal") { onSignal(msg); return; }
+  showIfOpen(msg);
+}
+
+function sendSignal(to, payload) {
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    state.ws.send(JSON.stringify({ type: "signal", to, payload }));
+  }
+}
+
+/* ---------- Calls (WebRTC) ---------- */
+/* The Java server only passes small "signals" between the two browsers.
+   Sound and video go directly from one browser to the other. */
+
+let call = null;       // the call in progress (or being set up)
+let incoming = null;   // a call that is ringing
+
+const newCall = (props) => ({ pc: null, stream: null, pendingIce: [], timer: null, ringTimeout: null, ...props });
+const stopStream = (s) => s && s.getTracks().forEach((t) => t.stop());
+
+async function getMedia(type) {
+  if (!navigator.mediaDevices) throw new Error("insecure");
+  return navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true },
+    video: type === "video" ? { facingMode: "user" } : false,
+  });
+}
+
+async function createPeer(c) {
+  let config;
+  try { config = await api("/api/ice"); }
+  catch { config = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] }; }
+
+  const pc = new RTCPeerConnection(config);
+  c.pc = pc;
+  c.stream.getTracks().forEach((t) => pc.addTrack(t, c.stream));
+  pc.onicecandidate = (e) => { if (e.candidate) sendSignal(c.peer, { kind: "ice", candidate: e.candidate }); };
+  pc.ontrack = (e) => { $("#remote-video").srcObject = e.streams[0]; };
+  pc.onconnectionstatechange = () => {
+    if (call !== c) return;
+    if (pc.connectionState === "connected") onConnected(c);
+    if (pc.connectionState === "failed") endCall("Connection lost", true);
+  };
+  return pc;
+}
+
+function showCallScreen(c, status) {
+  $("#call").classList.toggle("voice", c.type === "voice");
+  paintAvatar($("#call-avatar"), c.name, c.peer);
+  $("#call-name").textContent = c.name;
+  $("#call-status").textContent = status;
+  $("#toggle-cam").hidden = c.type !== "video";
+  for (const [id, on, off, label] of [["#toggle-mic", "i-mic", "i-mic-off", "microphone"], ["#toggle-cam", "i-cam", "i-cam-off", "camera"]]) {
+    $(id).classList.remove("off");
+    setIcon($(id), on);
+    $(id).setAttribute("aria-label", (label === "microphone" ? "Mute " : "Turn off ") + label);
+  }
+  $("#call").hidden = false;
+}
+
+const setStatus = (text) => ($("#call-status").textContent = text);
+
+function onConnected(c) {
+  if (c.connectedAt) return;
+  c.connectedAt = Date.now();
+  clearTimeout(c.ringTimeout);
+  setStatus("0:00");
+  c.timer = setInterval(() => setStatus(mmss((Date.now() - c.connectedAt) / 1000)), 1000);
+}
+
+async function flushIce(c) {
+  for (const cand of c.pendingIce.splice(0)) await c.pc.addIceCandidate(cand).catch(() => {});
+}
+
+function addIce(c, candidate) {
+  if (c.pc && c.pc.remoteDescription) c.pc.addIceCandidate(candidate).catch(() => {});
+  else c.pendingIce.push(candidate);     // arrived before we were ready; added later
+}
+
+async function startCall(type) {
+  if (call || incoming || !state.chat) return;
+  const { key: peer, displayName: name } = state.chat;
+  if (peer === state.me.key) { flash("You can't call yourself."); return; }
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) { flash("Reconnecting. Try again in a moment."); return; }
+
+  const c = newCall({ peer, name, type, role: "caller" });
+  call = c;
+  showCallScreen(c, "Starting…");
+  try {
+    c.stream = await getMedia(type);
+  } catch (e) {
+    if (call === c) { call = null; $("#call").hidden = true; }
+    flash(mediaError(e));
+    return;
+  }
+  if (call !== c) { stopStream(c.stream); return; }
+  $("#local-video").srcObject = c.stream;
+
+  const pc = await createPeer(c);
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  if (call !== c) { pc.close(); return; }
+  sendSignal(peer, { kind: "offer", callType: type, sdp: pc.localDescription });
+  setStatus("Calling…");
+  c.ringTimeout = setTimeout(() => endCall("No answer", true), 45000);
+}
+
+async function onOffer(from, p) {
+  // The server hands a still-ringing call to a tab that has just (re)connected; ignore it if we already have it.
+  if ((incoming && incoming.peer === from) || (call && call.role === "callee" && call.peer === from)) return;
+  if (call || incoming) { sendSignal(from, { kind: "reject", reason: "busy" }); return; }
+  const type = p.callType === "video" ? "video" : "voice";
+  const inc = { peer: from, name: formatKey(from), type, offer: p.sdp, ice: [] };
+  incoming = inc;                                  // set first so a second call sees "busy"
+  try { inc.name = (await api(`/api/users/by-key/${from}`)).displayName; } catch { /* keep the key */ }
+  if (incoming !== inc) return;                    // caller hung up while we looked up the name
+  paintAvatar($("#incoming-avatar"), inc.name, from);
+  $("#incoming-name").textContent = inc.name;
+  $("#incoming-type").textContent = type === "video" ? "Zavelo video call" : "Zavelo voice call";
+  $("#incoming").hidden = false;
+  startRinging();
+}
+
+async function answerCall() {
+  const inc = incoming;
+  if (!inc || call) return;
+  dismissIncoming();
+
+  const c = newCall({ peer: inc.peer, name: inc.name, type: inc.type, role: "callee" });
+  c.pendingIce = inc.ice;
+  call = c;
+  showCallScreen(c, "Connecting…");
+  try {
+    c.stream = await getMedia(inc.type);
+  } catch (e) {
+    if (call === c) { call = null; $("#call").hidden = true; sendSignal(inc.peer, { kind: "reject", reason: "media" }); }
+    flash(mediaError(e));
+    return;
+  }
+  if (call !== c) { stopStream(c.stream); return; }
+  $("#local-video").srcObject = c.stream;
+
+  const pc = await createPeer(c);
+  await pc.setRemoteDescription(inc.offer);
+  await flushIce(c);
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  sendSignal(inc.peer, { kind: "answer", sdp: pc.localDescription });
+}
+
+async function onAnswer(p) {
+  const c = call;
+  clearTimeout(c.ringTimeout);
+  await c.pc.setRemoteDescription(p.sdp);
+  await flushIce(c);
+  setStatus("Connecting…");
+}
+
+function onSignal(msg) {
+  const p = msg.payload || {};
+
+  // One of my other tabs answered or declined this call: stop ringing here.
+  if (msg.self) {
+    if (incoming && incoming.peer === msg.peer) dismissIncoming();
+    return;
+  }
+
+  const from = msg.from;
+  const inCallWith = call && call.peer === from;
+  switch (p.kind) {
+    case "offer": onOffer(from, p); break;
+    case "answer": if (inCallWith && call.role === "caller") onAnswer(p); break;
+    case "ice":
+      if (inCallWith) addIce(call, p.candidate);
+      else if (incoming && incoming.peer === from) incoming.ice.push(p.candidate);
+      break;
+    case "reject": if (inCallWith) endCall(p.reason === "busy" ? "They are on another call" : "Call declined", false); break;
+    case "unavailable": if (inCallWith) endCall("They are offline", false); break;
+    case "hangup":
+      if (inCallWith) endCall("Call ended", false);
+      else if (incoming && incoming.peer === from) { const name = incoming.name; dismissIncoming(); flash(`Missed call from ${name}`); }
+      break;
+  }
+}
+
+function endCall(reason, notifyPeer) {
+  const c = call;
+  if (!c) return;
+  call = null;
+  clearTimeout(c.ringTimeout);
+  clearInterval(c.timer);
+  if (notifyPeer) sendSignal(c.peer, { kind: "hangup" });
+  stopStream(c.stream);
+  if (c.pc) c.pc.close();
+  $("#remote-video").srcObject = null;
+  $("#local-video").srcObject = null;
+  $("#call").hidden = true;
+  if (reason) flash(reason);
+}
+
+function dismissIncoming() {
+  const peer = incoming && incoming.peer;
+  incoming = null;
+  stopRinging();
+  $("#incoming").hidden = true;
+  if (peer) closeNotifications("call-" + peer);
+}
+
+$("#voice-call").onclick = () => startCall("voice");
+$("#video-call").onclick = () => startCall("video");
+$("#answer").onclick = answerCall;
+$("#decline").onclick = () => {
+  if (!incoming) return;
+  sendSignal(incoming.peer, { kind: "reject" });
+  dismissIncoming();
+};
+$("#end-call").onclick = () => endCall("Call ended", true);
+
+/* Mute and camera buttons: the icon shows the state, with a slash when it is off. */
+function toggleTrack(btn, getTracks, onIcon, offIcon, onLabel, offLabel) {
+  if (!call || !call.stream) return;
+  const tracks = getTracks(call.stream);
+  if (!tracks.length) return;
+  const on = !tracks[0].enabled;
+  tracks.forEach((t) => (t.enabled = on));
+  btn.classList.toggle("off", !on);
+  setIcon(btn, on ? onIcon : offIcon);
+  btn.setAttribute("aria-label", on ? onLabel : offLabel);
+}
+$("#toggle-mic").onclick = (e) => toggleTrack(e.currentTarget, (s) => s.getAudioTracks(), "i-mic", "i-mic-off", "Mute microphone", "Unmute microphone");
+$("#toggle-cam").onclick = (e) => toggleTrack(e.currentTarget, (s) => s.getVideoTracks(), "i-cam", "i-cam-off", "Turn camera off", "Turn camera on");
+
+window.addEventListener("pagehide", () => { if (call) sendSignal(call.peer, { kind: "hangup" }); });
+
+/* Ringtone: soft beeps made in the browser, no audio files needed. */
+let ringCtx = null, ringTimer = null;
+function startRinging() {
+  try { ringCtx = ringCtx || new AudioContext(); ringCtx.resume(); } catch { return; }
+  const beep = () => {
+    const osc = ringCtx.createOscillator();
+    const gain = ringCtx.createGain();
+    osc.frequency.value = 480;
+    gain.gain.value = 0.08;
+    osc.connect(gain);
+    gain.connect(ringCtx.destination);
+    osc.start();
+    osc.stop(ringCtx.currentTime + 0.35);
+  };
+  beep();
+  ringTimer = setInterval(beep, 1500);
+}
+function stopRinging() { clearInterval(ringTimer); ringTimer = null; }
+
+/* ---------- Opening animation (4 seconds, tap to skip) ---------- */
+
+function runSplash() {
+  const splash = $("#splash");
+  const calm = matchMedia("(prefers-reduced-motion: reduce)").matches;   // no bouncing for people who turn motion off
+  splash.classList.toggle("calm", calm);
+  return new Promise((resolve) => {
+    const done = () => { if (splash.isConnected) { splash.remove(); resolve(); } };
+    setTimeout(done, calm ? 1200 : 4000);
+    splash.addEventListener("click", done);
+  });
+}
+const splashDone = runSplash();
+
+/* ---------- App lock (kept on this device only) ---------- */
+/* This is a privacy screen, like the lock in WhatsApp: it hides your chats from someone
+   holding your unlocked phone. It does not replace your phone's own lock. */
+
+const LOCK_KEY = "zavelo.lock", FAIL_KEY = "zavelo.lock.fails";
+const PBKDF2_ROUNDS = 210000;
+const enc = new TextEncoder();
+const b64 = (bytes) => btoa(String.fromCharCode(...bytes));
+const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+const readJson = (k) => { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } };
+const lockConfig = () => readJson(LOCK_KEY);
+const saveLock = (cfg) => localStorage.setItem(LOCK_KEY, JSON.stringify(cfg));
+function clearLock() { localStorage.removeItem(LOCK_KEY); localStorage.removeItem(FAIL_KEY); }
+
+async function hashSecret(secret, salt) {
+  const key = await crypto.subtle.importKey("raw", enc.encode(secret), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations: PBKDF2_ROUNDS }, key, 256);
+  return b64(new Uint8Array(bits));
+}
+async function checkSecret(secret, cfg) { return (await hashSecret(secret, unb64(cfg.salt))) === cfg.hash; }
+
+/* After 5 wrong tries the lock makes you wait: 30 s, then 60 s, 2 min, and so on up to 15 min. */
+function cooldownLeft() {
+  const f = readJson(FAIL_KEY);
+  return f && f.until > Date.now() ? Math.ceil((f.until - Date.now()) / 1000) : 0;
+}
+function recordFail() {
+  const f = readJson(FAIL_KEY) || { count: 0, until: 0 };
+  f.count++;
+  if (f.count % 5 === 0) f.until = Date.now() + Math.min(30 * 2 ** (f.count / 5 - 1), 900) * 1000;
+  localStorage.setItem(FAIL_KEY, JSON.stringify(f));
+}
+const clearFails = () => localStorage.removeItem(FAIL_KEY);
+
+/* Fingerprint / face: uses the phone's own screen-lock sensor through the browser (WebAuthn). */
+async function biometricAvailable() {
+  try {
+    return !!(window.PublicKeyCredential && await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable());
+  } catch { return false; }
+}
+async function registerBiometric() {
+  const cred = await navigator.credentials.create({
+    publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      rp: { name: "Zavelo" },
+      user: { id: crypto.getRandomValues(new Uint8Array(16)), name: state.me.key, displayName: state.me.displayName },
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+      authenticatorSelection: { authenticatorAttachment: "platform", userVerification: "required", residentKey: "discouraged" },
+      timeout: 60000,
+    },
+  });
+  return b64(new Uint8Array(cred.rawId));
+}
+async function verifyBiometric(cfg) {
+  await navigator.credentials.get({
+    publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      allowCredentials: [{ type: "public-key", id: unb64(cfg.bio), transports: ["internal"] }],
+      userVerification: "required",
+      timeout: 60000,
+    },
+  });
+}
+
+/* The lock screen */
+const lockState = { locked: false, hiddenAt: 0 };
+let coolTimer = null;
+
+function lockApp() {
+  const cfg = lockConfig();
+  if (!cfg || lockState.locked) return;
+  lockState.locked = true;
+  const pin = cfg.type === "pin";
+  const input = $("#lock-input");
+  input.value = "";
+  input.setAttribute("inputmode", pin ? "numeric" : "text");
+  input.setAttribute("maxlength", pin ? String(cfg.len) : "64");
+  input.setAttribute("aria-label", pin ? "PIN" : "Password");
+  input.placeholder = pin ? "Enter PIN" : "Enter password";
+  $("#lock-msg").textContent = "";
+  $("#lock-bio-btn").hidden = !cfg.bio;
+  $("#lock").hidden = false;
+  updateCooldown();
+  if (cfg.bio) splashDone.then(() => { if (lockState.locked) tryBiometric(); });
+  else splashDone.then(() => { if (lockState.locked && !input.disabled) input.focus(); });
+}
+
+function unlock() {
+  lockState.locked = false;
+  clearInterval(coolTimer);
+  $("#lock").hidden = true;
+  $("#lock-input").value = "";
+  $("#lock-input").blur();
+}
+
+function updateCooldown() {
+  clearInterval(coolTimer);
+  const tick = () => {
+    const secs = cooldownLeft();
+    $("#lock-input").disabled = secs > 0;
+    $("#lock-submit").disabled = secs > 0;
+    if (secs > 0) $("#lock-msg").textContent = `Too many tries. Wait ${secs} s.`;
+    else {
+      clearInterval(coolTimer);
+      if ($("#lock-msg").textContent.startsWith("Too many")) $("#lock-msg").textContent = "";
+    }
+  };
+  tick();
+  if (cooldownLeft() > 0) coolTimer = setInterval(tick, 1000);
+}
+
+async function tryUnlock() {
+  const cfg = lockConfig();
+  const value = $("#lock-input").value;
+  if (!cfg || !value || cooldownLeft() > 0) return;
+  if (await checkSecret(value, cfg)) { clearFails(); unlock(); return; }
+  recordFail();
+  $("#lock-input").value = "";
+  $("#lock-msg").textContent = cfg.type === "pin" ? "Wrong PIN." : "Wrong password.";
+  updateCooldown();
+}
+
+async function tryBiometric() {
+  const cfg = lockConfig();
+  if (!cfg || !cfg.bio) return;
+  try { await verifyBiometric(cfg); clearFails(); unlock(); }
+  catch { if (lockState.locked && cooldownLeft() === 0) $("#lock-msg").textContent = "Fingerprint did not work. Use your " + (cfg.type === "pin" ? "PIN." : "password."); }
+}
+
+$("#lock-form").onsubmit = (e) => { e.preventDefault(); tryUnlock(); };
+$("#lock-input").oninput = (e) => {
+  const cfg = lockConfig();
+  if (!cfg || cfg.type !== "pin") return;
+  e.target.value = e.target.value.replace(/\D/g, "").slice(0, cfg.len);
+  if (e.target.value.length === cfg.len) tryUnlock();      // a PIN unlocks as soon as the last digit is typed
+};
+$("#lock-bio-btn").onclick = tryBiometric;
+$("#lock-forgot").onclick = () => { if (confirm("Signing out removes the lock from this device. You will need to sign in again.")) signOut(); };
+
+/* Lock again when you come back after being away */
+document.addEventListener("visibilitychange", () => {
+  const cfg = lockConfig();
+  if (!cfg || !state.me) return;
+  if (document.hidden) lockState.hiddenAt = Date.now();
+  else if (lockState.hiddenAt && (Date.now() - lockState.hiddenAt) / 1000 >= cfg.timeout) lockApp();
+});
+
+/* ---------- Settings ---------- */
+
+let bioAvailable = false, afterVerify = null;
+const showLockPane = (name) => {
+  $("#lock-off").hidden = name !== "off";
+  $("#lock-setup").hidden = name !== "setup";
+  $("#lock-verify").hidden = name !== "verify";
+  $("#lock-on").hidden = name !== "on";
+};
+
+function renderLockSettings() {
+  const cfg = lockConfig();
+  if (!cfg) { showLockPane("off"); return; }
+  $("#lock-summary").textContent = "Locked with " + (cfg.type === "pin" ? "a PIN" : "a password") +
+    (cfg.bio ? " and fingerprint or face unlock." : ".");
+  $("#lock-timeout").value = String(cfg.timeout);
+  showLockPane("on");
+}
+
+async function openSettings() {
+  $("#menu").hidden = true;
+  $("#settings").hidden = false;
+  renderLockSettings();
+  renderNotifySettings();
+  refreshInstallRow();
+  bioAvailable = await biometricAvailable();
+  $("#bio-choice").hidden = !bioAvailable;
+}
+$("#menu-settings").onclick = openSettings;
+$("#settings-close").onclick = () => { $("#settings").hidden = true; };
+
+function openSetup() {
+  document.querySelector('input[name="lock-type"][value="pin"]').checked = true;
+  applyLockType();
+  $("#lock-bio").checked = bioAvailable;
+  $("#lock-error").textContent = "";
+  showLockPane("setup");
+  $("#lock-secret").focus();
+}
+
+function applyLockType() {
+  const pin = document.querySelector('input[name="lock-type"]:checked').value === "pin";
+  for (const id of ["#lock-secret", "#lock-confirm"]) {
+    $(id).value = "";
+    $(id).setAttribute("inputmode", pin ? "numeric" : "text");
+    $(id).setAttribute("maxlength", pin ? "6" : "64");
+  }
+  $("#lock-secret-label").textContent = pin ? "New PIN" : "New password";
+}
+document.querySelectorAll('input[name="lock-type"]').forEach((r) => (r.onchange = applyLockType));
+
+$("#lock-enable").onclick = openSetup;
+$("#lock-cancel").onclick = renderLockSettings;
+
+$("#lock-setup").onsubmit = async (e) => {
+  e.preventDefault();
+  const err = $("#lock-error");
+  err.textContent = "";
+  const type = document.querySelector('input[name="lock-type"]:checked').value;
+  const secret = $("#lock-secret").value;
+  if (type === "pin" && !/^\d{4,6}$/.test(secret)) { err.textContent = "A PIN must be 4 to 6 digits."; return; }
+  if (type === "password" && secret.length < 6) { err.textContent = "A password must be at least 6 characters."; return; }
+  if (secret !== $("#lock-confirm").value) { err.textContent = "The two entries do not match."; return; }
+  if (!window.crypto || !crypto.subtle) { err.textContent = "The lock needs a secure connection (HTTPS)."; return; }
+
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const old = lockConfig();
+  const cfg = {
+    owner: state.me.key, type, len: secret.length, salt: b64(salt),
+    hash: await hashSecret(secret, salt), bio: null, timeout: old ? old.timeout : 60,
+  };
+  let note = "App lock is on";
+  if (bioAvailable && $("#lock-bio").checked) {
+    try { cfg.bio = await registerBiometric(); }
+    catch { note = "App lock is on. Fingerprint was not set up."; }
+  }
+  saveLock(cfg);
+  clearFails();
+  renderLockSettings();
+  flash(note);
+};
+
+/* Changing or removing the lock asks for the current PIN or password first */
+function verifyThen(action) {
+  const cfg = lockConfig();
+  if (!cfg) return;
+  afterVerify = action;
+  $("#verify-label").textContent = cfg.type === "pin" ? "Enter your current PIN" : "Enter your current password";
+  $("#verify-secret").setAttribute("inputmode", cfg.type === "pin" ? "numeric" : "text");
+  $("#verify-secret").value = "";
+  $("#verify-error").textContent = "";
+  showLockPane("verify");
+  $("#verify-secret").focus();
+}
+$("#lock-verify").onsubmit = async (e) => {
+  e.preventDefault();
+  const cfg = lockConfig();
+  const wait = cooldownLeft();
+  if (wait > 0) { $("#verify-error").textContent = `Too many tries. Wait ${wait} s.`; return; }
+  if (await checkSecret($("#verify-secret").value, cfg)) { clearFails(); const go = afterVerify; afterVerify = null; go(); }
+  else { recordFail(); $("#verify-secret").value = ""; $("#verify-error").textContent = "That is not right."; }
+};
+$("#verify-cancel").onclick = renderLockSettings;
+
+$("#lock-change").onclick = () => verifyThen(openSetup);
+$("#lock-disable").onclick = () => verifyThen(() => { clearLock(); renderLockSettings(); flash("App lock is off"); });
+$("#lock-now").onclick = () => { $("#settings").hidden = true; lockApp(); };
+$("#lock-timeout").onchange = (e) => {
+  const cfg = lockConfig();
+  if (cfg) { cfg.timeout = Number(e.target.value); saveLock(cfg); }
+};
+
+/* ---------- Install as an app ---------- */
+
+let installEvent = null;
+const isStandalone = () => matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+
+function refreshInstallRow() {
+  const text = $("#install-text"), btn = $("#install-btn");
+  btn.hidden = true;
+  if (isStandalone()) text.textContent = "Zavelo is installed on this device.";
+  else if (installEvent) { text.textContent = "Add Zavelo to your home screen or desktop so it opens like an app."; btn.hidden = false; }
+  else if (/iphone|ipad|ipod/i.test(navigator.userAgent)) text.textContent = "On iPhone or iPad: tap the Share button, then Add to Home Screen.";
+  else text.textContent = "To install, open your browser menu and choose Install app or Add to Home screen.";
+}
+window.addEventListener("beforeinstallprompt", (e) => { e.preventDefault(); installEvent = e; refreshInstallRow(); });
+window.addEventListener("appinstalled", () => { installEvent = null; refreshInstallRow(); flash("Zavelo installed"); });
+$("#install-btn").onclick = async () => {
+  if (!installEvent) return;
+  installEvent.prompt();
+  await installEvent.userChoice;
+  installEvent = null;
+  refreshInstallRow();
+};
+
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" }).catch(() => {}));
+}
+
+/* ---------- Notifications ---------- */
+
+let pendingChatKey = null;
+{ // opened from a notification while Zavelo was closed: /?chat=<key>
+  const q = new URLSearchParams(location.search).get("chat");
+  if (q && /^\d{9}$/.test(q)) { pendingChatKey = q; try { history.replaceState(null, "", location.pathname); } catch { /* optional */ } }
+}
+
+const pushSupported = () => "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+const isIos = () => /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
+function keyToBytes(k) {
+  const raw = atob((k + "=".repeat((4 - (k.length % 4)) % 4)).replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(raw, (ch) => ch.charCodeAt(0));
+}
+function bytesToKey(buf) {
+  let s = "";
+  new Uint8Array(buf).forEach((b) => (s += String.fromCharCode(b)));
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function swReady() {
+  return Promise.race([
+    navigator.serviceWorker.ready,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("Zavelo is still starting. Try again in a moment.")), 8000)),
+  ]);
+}
+
+async function currentSubscription() {
+  if (!pushSupported()) return null;
+  try { return await (await swReady()).pushManager.getSubscription(); } catch { return null; }
+}
+
+/* Sign this phone up (or refresh its sign-up) for the account that is signed in. */
+async function subscribeThisDevice() {
+  const reg = await swReady();
+  const { key } = await api("/api/push/key");
+  let sub = await reg.pushManager.getSubscription();
+  if (sub && sub.options && sub.options.applicationServerKey && bytesToKey(sub.options.applicationServerKey) !== key) {
+    await sub.unsubscribe();               // the server's key changed, so the old sign-up can no longer be used
+    sub = null;
+  }
+  if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyToBytes(key) });
+  await api("/api/push/subscribe", { body: sub.toJSON() });
+  return sub;
+}
+
+async function enableNotifications() {
+  if (!pushSupported()) { flash("This browser can't show notifications."); return false; }
+  try {
+    let permission = Notification.permission;
+    if (permission === "default") permission = await Notification.requestPermission();   // must run straight from a tap
+    if (permission !== "granted") {
+      flash("Notifications are blocked. Allow them for Zavelo in your browser settings.");
+      return false;
+    }
+    await subscribeThisDevice();
+    flash("Notifications are on");
+    return true;
+  } catch (e) {
+    flash(e.message || "Could not turn on notifications.");
+    return false;
+  } finally {
+    renderNotifySettings();
+    updateNotifyBanner();
+  }
+}
+
+async function detachDevice() {
+  const sub = await currentSubscription();
+  if (!sub) return;
+  await api("/api/push/unsubscribe", { body: { endpoint: sub.endpoint }, tries: 2 }).catch(() => {});
+  await sub.unsubscribe().catch(() => {});
+}
+
+async function disableNotifications() {
+  await detachDevice();
+  renderNotifySettings();
+  updateNotifyBanner();
+}
+
+/* Each time Zavelo opens, make sure the server has this phone's current address under the signed-in account. */
+function syncPush() {
+  if (pushSupported() && Notification.permission === "granted") subscribeThisDevice().catch(() => {});
+}
+
+async function renderNotifySettings() {
+  const text = $("#notify-text"), btn = $("#notify-btn"), test = $("#notify-test");
+  btn.hidden = true; test.hidden = true;
+  if (!pushSupported()) {
+    const standalone = window.matchMedia("(display-mode: standalone)").matches || navigator.standalone;
+    text.textContent = isIos() && !standalone
+      ? "On iPhone, first add Zavelo to your Home Screen (Share, then Add to Home Screen), then open it from there to turn notifications on."
+      : "This browser can't show notifications.";
+    return;
+  }
+  if (Notification.permission === "denied") {
+    text.textContent = "Notifications are blocked for Zavelo. Allow them in your browser or phone settings, then come back here.";
+    return;
+  }
+  const sub = Notification.permission === "granted" ? await currentSubscription() : null;
+  btn.hidden = false;
+  if (sub) {
+    text.textContent = "You'll get a notification for new messages and calls on this device, even when Zavelo is closed.";
+    btn.textContent = "Turn off notifications";
+    btn.dataset.mode = "off";
+    test.hidden = false;
+  } else {
+    text.textContent = "Get a notification when someone messages or calls you, even when Zavelo is closed.";
+    btn.textContent = "Turn on notifications";
+    btn.dataset.mode = "on";
+  }
+}
+$("#notify-btn").onclick = async () => {
+  if ($("#notify-btn").dataset.mode === "off") await disableNotifications();
+  else await enableNotifications();
+};
+$("#notify-test").onclick = async () => {
+  try { await api("/api/push/test", { body: {} }); flash("Sent. It should arrive in a moment."); }
+  catch (e) { flash(e.message); }
+};
+
+const bannerDismissed = () => { try { return localStorage.getItem("zavelo.notify.dismissed") === "1"; } catch { return false; } };
+function updateNotifyBanner() {
+  $("#notify-banner").hidden = !(state.me && pushSupported() && Notification.permission === "default" && !bannerDismissed());
+}
+$("#notify-banner-on").onclick = enableNotifications;
+$("#notify-banner-no").onclick = () => {
+  try { localStorage.setItem("zavelo.notify.dismissed", "1"); } catch { /* optional */ }
+  updateNotifyBanner();
+};
+
+async function closeNotifications(tag) {
+  try {
+    if (!("serviceWorker" in navigator)) return;
+    const reg = await navigator.serviceWorker.getRegistration();
+    if (reg) (await reg.getNotifications({ tag })).forEach((n) => n.close());
+  } catch { /* optional */ }
+}
+
+async function openChatByKey(key) {
+  if (!/^\d{9}$/.test(key)) return;
+  if (!state.me) { pendingChatKey = key; return; }
+  const known = state.chats.find((c) => c.key === key);
+  let name = known ? known.displayName : null;
+  if (!name) { try { name = (await api(`/api/users/by-key/${key}`)).displayName; } catch { return; } }
+  openChat(key, name);
+}
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.addEventListener("message", (e) => {
+    if (e.data && e.data.type === "open-chat") openChatByKey(String(e.data.key));
+  });
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && state.chat) closeNotifications("msg-" + state.chat.key);
+});
+
+/* ---------- Start ---------- */
+
+function boot() {
+  try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch { /* optional */ }
+  if (lockConfig()) lockApp();             // a fresh open starts locked, before anything is shown
+  loadSession();
+}
+
+/* Only a 401 from the server means "not signed in". A sleeping or unreachable server is never treated as a
+   sign-out: nothing is cleared, and we keep trying. */
+async function loadSession() {
+  try {
+    enter(await api("/api/me", { tries: 20 }));
+  } catch (err) {
+    if (err.status === 401) {
+      unlock();                            // nothing to protect while signed out; the lock setting is kept
+      $("#connecting").hidden = true;
+      $("#auth").hidden = false;
+      prefillUser();
+    } else {
+      $("#connecting-msg").textContent = "Cannot reach Zavelo. Trying again…";
+      setTimeout(loadSession, 5000);
+    }
+  }
+}
+boot();

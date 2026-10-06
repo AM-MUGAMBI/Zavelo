@@ -48,7 +48,7 @@ public class ChatController {
         return out;
     }
 
-    private static String preview(Message m) {
+    static String preview(Message m) {
         if (m.isAudio()) return "Voice note";
         if (!m.isFile()) return m.getBody();
         String mime = m.getFileMime() == null ? "" : m.getFileMime();

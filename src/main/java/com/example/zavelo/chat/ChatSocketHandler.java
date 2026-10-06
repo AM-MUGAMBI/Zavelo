@@ -1,5 +1,6 @@
 package com.example.zavelo.chat;
 
+import com.example.zavelo.push.PushService;
 import com.example.zavelo.user.AppUser;
 import com.example.zavelo.user.UserRepository;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -11,6 +12,7 @@ import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -40,11 +42,22 @@ public class ChatSocketHandler extends TextWebSocketHandler {
     private final UserRepository users;
     private final MessageRepository messages;
     private final ObjectMapper json;
+    private final PushService push;
 
-    public ChatSocketHandler(UserRepository users, MessageRepository messages, ObjectMapper json) {
+    /**
+     * A call that is ringing for someone whose app may be closed. If they open Zavelo from the notification
+     * within 45 seconds, the call is handed to them so they can still answer. Key: callee username + "|" + caller key.
+     */
+    private static final long RING_MILLIS = 45_000;
+    private static final int MAX_HELD_FRAMES = 60;
+    private record PendingCall(long expiresAt, List<String> frames) {}
+    private final Map<String, PendingCall> pending = new ConcurrentHashMap<>();
+
+    public ChatSocketHandler(UserRepository users, MessageRepository messages, ObjectMapper json, PushService push) {
         this.users = users;
         this.messages = messages;
         this.json = json;
+        this.push = push;
     }
 
     @Override
@@ -53,7 +66,22 @@ public class ChatSocketHandler extends TextWebSocketHandler {
             session.close(CloseStatus.POLICY_VIOLATION);
             return;
         }
-        online.computeIfAbsent(session.getPrincipal().getName(), k -> ConcurrentHashMap.newKeySet()).add(session);
+        String username = session.getPrincipal().getName();
+        online.computeIfAbsent(username, k -> ConcurrentHashMap.newKeySet()).add(session);
+        replayHeldCalls(username, session);
+    }
+
+    /** Hand a still-ringing call to a device that has only just opened Zavelo. */
+    private void replayHeldCalls(String username, WebSocketSession session) {
+        long now = System.currentTimeMillis();
+        String prefix = username + "|";
+        pending.entrySet().removeIf(e -> e.getValue().expiresAt() < now);
+        pending.forEach((key, call) -> {
+            if (!key.startsWith(prefix)) return;
+            List<String> frames;
+            synchronized (call.frames()) { frames = new ArrayList<>(call.frames()); }
+            for (String frame : frames) sendRaw(session, frame);
+        });
     }
 
     @Override
@@ -108,6 +136,10 @@ public class ChatSocketHandler extends TextWebSocketHandler {
                 sendTo(s, dto);
             }
         }
+        // Tell the other person's phone, even if Zavelo is closed (the phone skips it if Zavelo is on screen).
+        if (!sender.getId().equals(recipient.getId())) {
+            push.notifyMessage(recipient, sender, ChatController.preview(saved));
+        }
     }
 
     private void relaySignal(WebSocketSession session, AppUser sender, AppUser recipient, JsonNode payload) {
@@ -130,10 +162,41 @@ public class ChatSocketHandler extends TextWebSocketHandler {
             }
         }
 
-        // Nobody online to ring.
-        if (!delivered && kind.equals("offer")) {
-            sendTo(session, Map.of("type", "signal", "from", recipient.getConnectKey(),
-                    "payload", Map.of("kind", "unavailable")));
+        // The ringing call is kept for 45 seconds so a phone woken by a notification can still pick it up.
+        String callKey = recipient.getUsername() + "|" + sender.getConnectKey();
+        switch (kind) {
+            case "offer" -> {
+                boolean reachable = push.hasDevice(recipient);
+                if (!delivered && !reachable) {
+                    // Nobody online to ring and no phone to notify.
+                    sendTo(session, Map.of("type", "signal", "from", recipient.getConnectKey(),
+                            "payload", Map.of("kind", "unavailable")));
+                } else if (reachable) {
+                    long now = System.currentTimeMillis();
+                    pending.entrySet().removeIf(e -> e.getValue().expiresAt() < now);
+                    List<String> frames = new ArrayList<>();
+                    frames.add(toJson(out));
+                    pending.put(callKey, new PendingCall(now + RING_MILLIS, frames));
+                    push.notifyCall(recipient, sender, payload.path("callType").asText("audio"));
+                }
+            }
+            case "ice" -> {
+                PendingCall call = pending.get(callKey);
+                if (call != null) {
+                    synchronized (call.frames()) {
+                        if (call.frames().size() < MAX_HELD_FRAMES) call.frames().add(toJson(out));
+                    }
+                }
+            }
+            case "hangup" -> {
+                // The caller gave up while it was still ringing: leave a "Missed call" notification.
+                if (pending.remove(callKey) != null) push.notifyCallEnded(recipient, sender);
+                pending.remove(sender.getUsername() + "|" + recipient.getConnectKey());
+            }
+            case "answer", "reject" ->
+                // I (the callee) answered or declined: the call is no longer waiting for me.
+                pending.remove(sender.getUsername() + "|" + recipient.getConnectKey());
+            default -> { }
         }
 
         // If the call was answered or declined in this tab, stop the ringing in my other tabs.
@@ -148,10 +211,21 @@ public class ChatSocketHandler extends TextWebSocketHandler {
         }
     }
 
+    private String toJson(Object payload) {
+        try {
+            return json.writeValueAsString(payload);
+        } catch (IOException e) {
+            return "{}";
+        }
+    }
+
     private void sendTo(WebSocketSession session, Object payload) {
+        sendRaw(session, toJson(payload));
+    }
+
+    private void sendRaw(WebSocketSession session, String msg) {
         if (!session.isOpen()) return;
         try {
-            String msg = json.writeValueAsString(payload);
             synchronized (session) {   // a session can only send one message at a time
                 session.sendMessage(new TextMessage(msg));
             }

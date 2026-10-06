@@ -60,3 +60,13 @@ The icon files are in static/icons. To change the icon, replace static/icon.svg 
 ## App lock
 Settings > App lock: PIN or password, plus fingerprint or face unlock when the device offers it.
 The lock is stored on the device only and works as a privacy screen over your chats.
+
+## Notifications (messages and calls)
+
+Zavelo sends Web Push notifications, so your phone is told about a new message or an incoming call even when Zavelo is closed.
+
+- Each person turns them on once, on each device: **Settings → Notifications → Turn on notifications** (or the "Turn on" banner at the top of the chat list).
+- **iPhone/iPad:** notifications only work after you add Zavelo to the Home Screen (Share → Add to Home Screen) and open it from there (iOS 16.4 or newer).
+- The server makes its notification signing keys the first time it starts and keeps them in the database. Nothing to configure. Optionally set `PUSH_SUBJECT` (e.g. `mailto:you@example.com`) to give push services a contact address.
+- A call notification stays on screen with vibration. Tapping it opens Zavelo and the call (held for 45 seconds) appears with Answer/Decline. A browser notification cannot loop a phone ringtone the way a native phone app can.
+- On the free Render plan the server sleeps when idle; a sleeping server cannot send notifications until someone's activity wakes it. The Starter plan keeps it awake.
