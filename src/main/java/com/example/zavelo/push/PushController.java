@@ -1,5 +1,6 @@
 package com.example.zavelo.push;
 
+import com.example.zavelo.chat.ChatSocketHandler;
 import com.example.zavelo.user.UserRepository;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import org.springframework.http.HttpStatus;
@@ -24,10 +25,22 @@ public class PushController {
 
     private final PushService push;
     private final UserRepository users;
+    private final ChatSocketHandler chat;
 
-    public PushController(PushService push, UserRepository users) {
+    public PushController(PushService push, UserRepository users, ChatSocketHandler chat) {
         this.push = push;
         this.users = users;
+        this.chat = chat;
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record DeclineRequest(String from) {}
+
+    /** "Decline" pressed on a call notification: tells the caller, without opening the app. */
+    @PostMapping("/decline")
+    public Map<String, Object> decline(@RequestBody DeclineRequest req, Authentication auth) {
+        chat.declineFromNotification(users.findByUsername(auth.getName()).orElseThrow(), req == null ? null : req.from());
+        return Map.of("ok", true);
     }
 
     @GetMapping("/key")

@@ -5,7 +5,7 @@ import java.time.Instant;
 
 /** One phone/browser that asked to receive notifications for one user. */
 @Entity
-@Table(name = "push_subscriptions", indexes = @Index(name = "idx_push_user", columnList = "userId"))
+@Table(name = "push_subscriptions")
 public class PushSubscription {
 
     @Id

@@ -56,7 +56,10 @@ public class PushService {
 
     // ------------------------------------------------------------------ device sign-up
 
-    public String publicKey() { return vapid.publicKey(); }
+    public String publicKey() {
+        if (!vapid.ready()) throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Notifications are not available right now.");
+        return vapid.publicKey();
+    }
 
     /**
      * Only the real push services of the big browsers are allowed. Without this check, someone could "subscribe"
@@ -130,6 +133,7 @@ public class PushService {
                 from, video ? "video" : "audio", false), 45, "high");
     }
 
+
     /** The caller hung up before it was answered. */
     public void notifyCallEnded(AppUser to, AppUser from) {
         send(to, payload("call-end", from.getDisplayName(), "Missed call", from, null, false), 86_400, "normal");
@@ -151,6 +155,7 @@ public class PushService {
     }
 
     private void send(AppUser to, Map<String, Object> payload, int ttlSeconds, String urgency) {
+        if (!vapid.ready()) return;
         Long userId = to.getId();
         try {
             pool.execute(() -> {

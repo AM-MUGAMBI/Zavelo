@@ -19,6 +19,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 /**
  * One WebSocket per open browser tab. The user is identified by the login session,
@@ -52,6 +55,44 @@ public class ChatSocketHandler extends TextWebSocketHandler {
     private static final int MAX_HELD_FRAMES = 60;
     private record PendingCall(long expiresAt, List<String> frames) {}
     private final Map<String, PendingCall> pending = new ConcurrentHashMap<>();
+
+    /** While a call is ringing for a phone, its notification is repeated (so the phone buzzes and chimes again, like ringing). */
+    private static final long RING_REPEAT_SECONDS = 6;
+    private static final int RING_REPEATS = 6;
+    private final ScheduledExecutorService ringer = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "zavelo-ring");
+        t.setDaemon(true);
+        return t;
+    });
+
+    private void scheduleRing(String callKey, PendingCall call, AppUser recipient, AppUser sender, String callType, int count) {
+        if (count > RING_REPEATS) return;
+        try {
+            ringer.schedule(() -> {
+                try {
+                    // still the same call, still ringing, and nobody has the app open to hear it
+                    if (pending.get(callKey) != call || System.currentTimeMillis() > call.expiresAt()) return;
+                    push.notifyCall(recipient, sender, callType);
+                    scheduleRing(callKey, call, recipient, sender, callType, count + 1);
+                } catch (RuntimeException ignored) {
+                    // notifications are best-effort
+                }
+            }, RING_REPEAT_SECONDS, TimeUnit.SECONDS);
+        } catch (RuntimeException ignored) {
+            // scheduler is shutting down
+        }
+    }
+
+    /** The callee tapped "Decline" on the notification, without opening the app. */
+    public void declineFromNotification(AppUser callee, String callerKey) {
+        Optional<AppUser> caller = users.findByConnectKey(callerKey == null ? "" : callerKey.replaceAll("\\D", ""));
+        if (caller.isEmpty()) return;
+        pending.remove(callee.getUsername() + "|" + caller.get().getConnectKey());
+        Map<String, Object> reject = Map.of("type", "signal", "from", callee.getConnectKey(), "payload", Map.of("kind", "reject"));
+        for (WebSocketSession s : online.getOrDefault(caller.get().getUsername(), Set.of())) sendTo(s, reject);
+        Map<String, Object> self = Map.of("type", "signal", "self", true, "peer", caller.get().getConnectKey(), "payload", Map.of("kind", "reject"));
+        for (WebSocketSession s : online.getOrDefault(callee.getUsername(), Set.of())) sendTo(s, self);
+    }
 
     public ChatSocketHandler(UserRepository users, MessageRepository messages, ObjectMapper json, PushService push) {
         this.users = users;
@@ -138,7 +179,7 @@ public class ChatSocketHandler extends TextWebSocketHandler {
         }
         // Tell the other person's phone, even if Zavelo is closed (the phone skips it if Zavelo is on screen).
         if (!sender.getId().equals(recipient.getId())) {
-            push.notifyMessage(recipient, sender, ChatController.preview(saved));
+            try { push.notifyMessage(recipient, sender, ChatController.preview(saved)); } catch (RuntimeException ignored) { /* never block chat */ }
         }
     }
 
@@ -166,7 +207,8 @@ public class ChatSocketHandler extends TextWebSocketHandler {
         String callKey = recipient.getUsername() + "|" + sender.getConnectKey();
         switch (kind) {
             case "offer" -> {
-                boolean reachable = push.hasDevice(recipient);
+                boolean reachable;
+                try { reachable = push.hasDevice(recipient); } catch (RuntimeException e) { reachable = false; }
                 if (!delivered && !reachable) {
                     // Nobody online to ring and no phone to notify.
                     sendTo(session, Map.of("type", "signal", "from", recipient.getConnectKey(),
@@ -176,8 +218,11 @@ public class ChatSocketHandler extends TextWebSocketHandler {
                     pending.entrySet().removeIf(e -> e.getValue().expiresAt() < now);
                     List<String> frames = new ArrayList<>();
                     frames.add(toJson(out));
-                    pending.put(callKey, new PendingCall(now + RING_MILLIS, frames));
-                    push.notifyCall(recipient, sender, payload.path("callType").asText("audio"));
+                    PendingCall held = new PendingCall(now + RING_MILLIS, frames);
+                    pending.put(callKey, held);
+                    String callType = payload.path("callType").asText("audio");
+                    try { push.notifyCall(recipient, sender, callType); } catch (RuntimeException ignored) { /* never block calls */ }
+                    scheduleRing(callKey, held, recipient, sender, callType, 1);
                 }
             }
             case "ice" -> {
@@ -190,7 +235,9 @@ public class ChatSocketHandler extends TextWebSocketHandler {
             }
             case "hangup" -> {
                 // The caller gave up while it was still ringing: leave a "Missed call" notification.
-                if (pending.remove(callKey) != null) push.notifyCallEnded(recipient, sender);
+                if (pending.remove(callKey) != null) {
+                    try { push.notifyCallEnded(recipient, sender); } catch (RuntimeException ignored) { /* never block calls */ }
+                }
                 pending.remove(sender.getUsername() + "|" + recipient.getConnectKey());
             }
             case "answer", "reject" ->

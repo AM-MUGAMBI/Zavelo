@@ -88,7 +88,7 @@ async function showPush(d) {
 
   const call = type === "call";
   const tag = d.test ? "test" : call ? "call-" + from : type === "call-end" ? "missed-" + from : "msg-" + from;
-  await self.registration.showNotification(d.title || "Zavelo", {
+  await self.registration.showNotification(call ? "\u{1F4DE} " + (d.title || "Zavelo") : (d.title || "Zavelo"), {
     body: d.body || "",
     tag,
     renotify: true,
@@ -96,7 +96,8 @@ async function showPush(d) {
     badge: "/icons/badge-96.png",
     data: { from, type },
     requireInteraction: call,                                   // a call stays until you answer or dismiss it
-    vibrate: call ? [400, 200, 400, 200, 400, 200, 400] : [150],
+    vibrate: call ? [500, 250, 500, 250, 500, 250, 500] : [150],
+    actions: call ? [{ action: "answer", title: "Answer" }, { action: "decline", title: "Decline" }] : [],
   });
 }
 
@@ -109,6 +110,14 @@ self.addEventListener("push", (e) => {
 self.addEventListener("notificationclick", (e) => {
   e.notification.close();
   const from = (e.notification.data || {}).from || "";
+  if (e.action === "decline" && from) {
+    // Decline without opening the app.
+    e.waitUntil(fetch("/api/push/decline", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ from }),
+    }).catch(() => {}));
+    return;
+  }
   e.waitUntil((async () => {
     const list = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
     for (const c of list) {

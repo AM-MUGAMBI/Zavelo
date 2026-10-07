@@ -70,3 +70,5 @@ Zavelo sends Web Push notifications, so your phone is told about a new message o
 - The server makes its notification signing keys the first time it starts and keeps them in the database. Nothing to configure. Optionally set `PUSH_SUBJECT` (e.g. `mailto:you@example.com`) to give push services a contact address.
 - A call notification stays on screen with vibration. Tapping it opens Zavelo and the call (held for 45 seconds) appears with Answer/Decline. A browser notification cannot loop a phone ringtone the way a native phone app can.
 - On the free Render plan the server sleeps when idle; a sleeping server cannot send notifications until someone's activity wakes it. The Starter plan keeps it awake.
+
+While a call is ringing for a phone, its notification is sent again every 6 seconds (up to 6 more times) so the phone buzzes and chimes repeatedly, and the notification has Answer and Decline buttons. Decline works without opening the app.

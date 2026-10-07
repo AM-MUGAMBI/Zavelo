@@ -61,9 +61,15 @@ class ApiError extends Error {
 const isWakingReply = (res) => res.status === 502 || res.status === 503 || res.status === 504 ||
   (res.ok && !(res.headers.get("content-type") || "").includes("json"));
 
+let wakingSince = 0;
 function setWaking(on) {
+  if (on && !wakingSince) wakingSince = Date.now();
+  if (!on) wakingSince = 0;
+  const slow = on && Date.now() - wakingSince > 90000;
   if (!$("#connecting").hidden) {
-    $("#connecting-msg").textContent = on ? "Waking up Zavelo… this can take up to a minute." : "Connecting…";
+    $("#connecting-msg").textContent = !on ? "Connecting…" : slow
+      ? "Zavelo is taking much longer than usual. The server may be having a problem. Still trying…"
+      : "Waking up Zavelo… this can take up to a minute.";
   } else {
     $("#waking").hidden = !on;
   }

@@ -33,7 +33,19 @@ public class VapidKeys {
     }
 
     @PostConstruct
-    void load() {
+    void init() {
+        try {
+            load();
+        } catch (RuntimeException e) {
+            // Notifications are a bonus: if the keys cannot be made, the app must still start and chat must still work.
+            privateKey = null;
+            publicKeyB64 = null;
+        }
+    }
+
+    public boolean ready() { return privateKey != null && publicKeyB64 != null; }
+
+    private void load() {
         Optional<AppSetting> priv = settings.findById(PRIVATE);
         Optional<AppSetting> pub = settings.findById(PUBLIC);
         if (priv.isPresent() && pub.isPresent()) {
